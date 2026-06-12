@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>STEP Draft Viewer</title>
+  </head>
+  <body>
+    <main id="app">
+      <section class="toolbar" aria-label="Viewer controls">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <span>STEP Draft</span>
+        </div>
+        <label class="upload-button">
+          <input id="step-upload" type="file" accept=".step,.stp,.STEP,.STP" />
+          Upload STEP
+        </label>
+        <label class="field">
+          <span>Draft angle</span>
+          <input id="draft-angle" type="number" min="0" max="89" step="0.1" value="3" />
+        </label>
+        <button id="download-split-step" class="ghost-button" type="button" disabled>Download split STEP</button>
+        <button id="clear-model" class="ghost-button" type="button">Clear</button>
+        <div id="status" class="status" role="status">Ready for a STEP file</div>
+      </section>
+      <section class="viewport-wrap">
+        <canvas id="viewer"></canvas>
+        <div id="empty-state" class="empty-state">
+          <strong>No model loaded</strong>
+          <span>Upload a STEP file to triangulate it with OCCT.</span>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
