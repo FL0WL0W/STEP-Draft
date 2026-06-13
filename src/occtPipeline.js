@@ -1,4 +1,4 @@
-import initOpenCascade from 'opencascade.js/dist/index.js';
+import ocFullWasm from 'opencascade.js/dist/opencascade.full.wasm';
 import {
   findConeSplitSurfaces,
   findCylinderSplitSurfaces,
@@ -7,6 +7,25 @@ import {
 } from './findSplitSurface.js';
 
 let openCascadePromise;
+
+async function initOpenCascade() {
+  globalThis.__filename = globalThis.__filename || '/opencascade.full.js';
+  globalThis.__dirname = globalThis.__dirname || '/';
+
+  const { default: ocFullJS } = await import('opencascade.js/dist/opencascade.full.js');
+
+  return new Promise((resolve, reject) => {
+    new ocFullJS({
+      locateFile(path) {
+        if (path.endsWith('.wasm')) {
+          return ocFullWasm;
+        }
+
+        return path;
+      }
+    }).then(resolve, reject);
+  });
+}
 
 export function getOpenCascade() {
   if (!openCascadePromise) {
@@ -193,6 +212,40 @@ function writeStepShape(oc, shape) {
   }
 
   return oc.FS.readFile(path, { encoding: 'utf8' });
+}
+
+function uniqueTempPath(prefix, extension) {
+  const random = Math.random().toString(36).slice(2);
+  return `/tmp/${prefix}-${Date.now()}-${random}.${extension}`;
+}
+
+function writeBrepShape(oc, shape) {
+  const path = uniqueTempPath('shape', 'brep');
+  const progress = makeInstance(oc, 'Message_ProgressRange');
+  const ok = callAny(oc.BRepTools, ['Write'], [shape, path, progress]);
+
+  if (!ok) {
+    throw new Error('OpenCascade could not serialize replacement face to BREP.');
+  }
+
+  return oc.FS.readFile(path, { encoding: 'utf8' });
+}
+
+function readBrepShape(oc, brepText) {
+  const path = uniqueTempPath('replacement', 'brep');
+  const shape = makeInstance(oc, 'TopoDS_Shape');
+  const builder = makeInstance(oc, 'BRep_Builder');
+  const progress = makeInstance(oc, 'Message_ProgressRange');
+
+  oc.FS.writeFile(path, brepText);
+
+  const ok = callAny(oc.BRepTools, ['Read'], [shape, path, builder, progress]);
+
+  if (!ok || callAny(shape, ['IsNull'])) {
+    throw new Error('OpenCascade could not read replacement BREP from worker.');
+  }
+
+  return shape;
 }
 
 const RENDER_LINEAR_DEFLECTION = 0.025;
@@ -1726,6 +1779,326 @@ function tryFaceDivideApexCone(oc, shape, face, faceSurface, splitSurfaces) {
   }
 }
 
+function createSplitDiagnostics() {
+  return {
+    apexConeFaceDivide: [],
+    coneBoundaryChecks: [],
+    failedCandidates: [],
+    generatedSurfaces: [],
+    successfulCandidates: [],
+    torusSplits: [],
+    totals: {},
+    totalSplitAttempts: 0,
+    successfulSplits: 0
+  };
+}
+
+function surfaceStatsForDiagnostics(diagnostics, surfaceType) {
+  if (!diagnostics.totals[surfaceType]) {
+    diagnostics.totals[surfaceType] = {
+      faces: 0,
+      splitSurfaces: 0,
+      sectionEdges: 0,
+      toolFaces: 0,
+      successfulSplits: 0,
+      failedCandidates: 0
+    };
+  }
+
+  return diagnostics.totals[surfaceType];
+}
+
+function mergeSplitDiagnostics(target, source) {
+  for (const key of [
+    'apexConeFaceDivide',
+    'coneBoundaryChecks',
+    'failedCandidates',
+    'generatedSurfaces',
+    'successfulCandidates',
+    'torusSplits'
+  ]) {
+    target[key].push(...(source[key] || []));
+  }
+
+  target.totalSplitAttempts += source.totalSplitAttempts || 0;
+  target.successfulSplits += source.successfulSplits || 0;
+
+  for (const [surfaceType, sourceStats] of Object.entries(source.totals || {})) {
+    const stats = surfaceStatsForDiagnostics(target, surfaceType);
+
+    for (const key of Object.keys(stats)) {
+      stats[key] += sourceStats[key] || 0;
+    }
+  }
+}
+
+function acceptedReplacement(oc, replacement) {
+  return replacement && countFaces(oc, replacement) > 1;
+}
+
+function splitSingleFaceBySurfaces(oc, shape, face, faceIndex, draftAngleDegrees) {
+  const diagnostics = createSplitDiagnostics();
+  const failedSplitFaceKeys = new Set();
+  const faceKey = shapeKey(face, faceIndex);
+  const faceSurface = makeInstance(oc, 'BRepAdaptor_Surface', [face, true]);
+  const surfaceType = getSurfaceType(oc, faceSurface);
+  const splitSurfaces = primitiveSplitSurfacesForFace(oc, face, draftAngleDegrees);
+  const stats = surfaceStatsForDiagnostics(diagnostics, surfaceType);
+  const edges = [];
+  const tools = [];
+  const methodResults = [];
+  let coneBoundaryTouchesApex = false;
+
+  if (splitSurfaces.length === 0) {
+    return {
+      diagnostics,
+      failedSplitFaceKeys,
+      faceIndex,
+      faceKey,
+      replacement: null,
+      skipped: true,
+      surfaceType
+    };
+  }
+
+  if (surfaceType === 'cone') {
+    try {
+      const cone = callAny(faceSurface, ['Cone']);
+      const apex = pointToArray(callAny(cone, ['Apex']));
+      const refRadius = callAny(cone, ['RefRadius']);
+      const apexTolerance = Math.max(1e-6, Math.abs(refRadius) * 1e-5, distanceBetween(apex, pointToArray(callAny(cone, ['Location']))) * 1e-7);
+      coneBoundaryTouchesApex = faceBoundaryTouchesPoint(oc, face, apex, apexTolerance);
+    } catch {
+      coneBoundaryTouchesApex = false;
+    }
+  }
+
+  stats.faces += 1;
+  stats.splitSurfaces += splitSurfaces.length;
+  diagnostics.generatedSurfaces.push({
+    coneBoundaryTouchesApex,
+    faceIndex,
+    surfaceType,
+    splitSurfaces: splitSurfaces.map((splitSurface) => {
+      if (splitSurface.type === 'plane') {
+        return {
+          point: splitSurface.point,
+          bnormal: splitSurface.normal,
+          type: splitSurface.type
+        };
+      }
+
+      return {
+        columns: splitSurface.points?.[0]?.length || 0,
+        rows: splitSurface.points?.length || 0,
+        type: splitSurface.type
+      };
+    })
+  });
+
+  for (const splitSurface of splitSurfaces) {
+    const sectionEdges = sectionFaceWithSplitSurface(oc, face, splitSurface);
+
+    stats.sectionEdges += sectionEdges.length;
+    edges.push(...sectionEdges);
+
+    const toolFace = makeToolFaceFromSplitSurface(oc, splitSurface);
+
+    if (toolFace) {
+      tools.push(toolFace);
+      stats.toolFaces += 1;
+    }
+  }
+
+  if (surfaceType === 'torus') {
+    diagnostics.torusSplits.push({
+      faceIndex,
+      faceKey,
+      phase: 'candidate-built',
+      sectionEdges: edges.length,
+      splitSurfaces: splitSurfaces.map((splitSurface) => ({
+        columns: splitSurface.points?.[0]?.length || null,
+        rows: splitSurface.points?.length || null,
+        type: splitSurface.type
+      })),
+      toolFaces: tools.length
+    });
+  }
+
+  if (edges.length === 0 && tools.length === 0 && !(surfaceType === 'cone' && coneBoundaryTouchesApex)) {
+    failedSplitFaceKeys.add(faceKey);
+    diagnostics.failedCandidates.push({
+      faceIndex,
+      faceKey,
+      reason: 'No section edges or tool faces were produced',
+      splitSurfaces: splitSurfaces.length,
+      surfaceType
+    });
+    stats.failedCandidates += 1;
+    return {
+      diagnostics,
+      failedSplitFaceKeys,
+      faceIndex,
+      faceKey,
+      replacement: null,
+      skipped: false,
+      surfaceType
+    };
+  }
+
+  diagnostics.totalSplitAttempts += 1;
+  let replacement = null;
+  const wireGroups = splitEdgeGroupsForWires(oc, edges);
+
+  if (surfaceType === 'cone' && coneBoundaryTouchesApex) {
+    const faceDivideResult = tryFaceDivideApexCone(oc, face, face, faceSurface, splitSurfaces);
+    replacement = faceDivideResult.shape;
+    methodResults.push({
+      attempts: faceDivideResult.attempts,
+      error: faceDivideResult.error,
+      method: 'cone-apex-face-divide-u-split',
+      resultFaces: faceDivideResult.resultFaces,
+      success: acceptedReplacement(oc, replacement),
+      uSplitValues: faceDivideResult.uSplitValues
+    });
+    diagnostics.apexConeFaceDivide.push({
+      attempts: faceDivideResult.attempts,
+      bounds: faceDivideResult.bounds,
+      error: faceDivideResult.error,
+      faceIndex,
+      faceKey,
+      resultFaces: faceDivideResult.resultFaces,
+      success: acceptedReplacement(oc, replacement),
+      uSplitValues: faceDivideResult.uSplitValues
+    });
+
+    if (!acceptedReplacement(oc, replacement)) {
+      replacement = null;
+    }
+  }
+
+  if (!replacement && wireGroups.length > 0) {
+    replacement = trySplitFaceWithWires(oc, face, face, wireGroups.map((group) => group.wire));
+    methodResults.push({
+      method: 'split-face-wires',
+      resultFaces: replacement ? countFaces(oc, replacement) : null,
+      success: acceptedReplacement(oc, replacement),
+      wireTools: wireGroups.length
+    });
+
+    if (!acceptedReplacement(oc, replacement)) {
+      replacement = null;
+    }
+  }
+
+  if (!replacement && wireGroups.length > 0) {
+    replacement = trySplitFaceWithWires(oc, face, face, wireGroups.map((group) => group.wire), false);
+    methodResults.push({
+      method: 'split-face-wires-relaxed-boundary',
+      resultFaces: replacement ? countFaces(oc, replacement) : null,
+      success: acceptedReplacement(oc, replacement),
+      wireTools: wireGroups.length
+    });
+
+    if (!acceptedReplacement(oc, replacement)) {
+      replacement = null;
+    }
+  }
+
+  if (!replacement && edges.length > 0) {
+    replacement = trySplitFaceWithEdges(oc, face, face, edges);
+    methodResults.push({
+      method: 'split-face-edges',
+      resultFaces: replacement ? countFaces(oc, replacement) : null,
+      success: acceptedReplacement(oc, replacement)
+    });
+
+    if (!acceptedReplacement(oc, replacement)) {
+      replacement = null;
+    }
+  }
+
+  if (!replacement && edges.length > 0) {
+    replacement = trySplitFaceWithEdges(oc, face, face, edges, false);
+    methodResults.push({
+      method: 'split-face-edges-relaxed-boundary',
+      resultFaces: replacement ? countFaces(oc, replacement) : null,
+      success: acceptedReplacement(oc, replacement)
+    });
+
+    if (!acceptedReplacement(oc, replacement)) {
+      replacement = null;
+    }
+  }
+
+  if (!replacement && (surfaceType === 'torus' || isGeneralSurfaceType(surfaceType)) && tools.length > 0) {
+    replacement = tryBooleanSplitShape(oc, face, tools);
+    methodResults.push({
+      method: `${surfaceType}-face-boolean-tool-split`,
+      resultFaces: replacement ? countFaces(oc, replacement) : null,
+      success: acceptedReplacement(oc, replacement),
+      toolFaces: tools.length
+    });
+
+    if (!acceptedReplacement(oc, replacement)) {
+      replacement = null;
+    }
+  }
+
+  if (surfaceType === 'torus') {
+    diagnostics.torusSplits.push({
+      edgeTools: edges.length,
+      faceIndex,
+      faceKey,
+      methodResults,
+      phase: 'candidate-tried',
+      resultFaces: replacement ? countFaces(oc, replacement) : null,
+      success: acceptedReplacement(oc, replacement),
+      toolFaces: tools.length
+    });
+  }
+
+  if (acceptedReplacement(oc, replacement)) {
+    const successfulMethod = methodResults.find((result) => result.success)?.method || null;
+
+    diagnostics.successfulCandidates.push({
+      coneBoundaryTouchesApex: surfaceType === 'cone' ? coneBoundaryTouchesApex : undefined,
+      edgeTools: edges.length,
+      faceIndex,
+      faceKey,
+      method: successfulMethod,
+      resultFaces: countFaces(oc, replacement),
+      surfaceType,
+      toolFaces: tools.length
+    });
+    diagnostics.successfulSplits += 1;
+    stats.successfulSplits += 1;
+  } else {
+    failedSplitFaceKeys.add(faceKey);
+    diagnostics.failedCandidates.push({
+      coneBoundaryTouchesApex: surfaceType === 'cone' ? coneBoundaryTouchesApex : undefined,
+      edgeTools: edges.length,
+      faceIndex,
+      faceKey,
+      methodResults,
+      reason: 'Face-local OCCT split did not produce replacement faces',
+      surfaceTools: tools.length,
+      surfaceType
+    });
+    stats.failedCandidates += 1;
+  }
+
+  return {
+    diagnostics,
+    failedSplitFaceKeys,
+    faceIndex,
+    faceKey,
+    replacement: acceptedReplacement(oc, replacement) ? replacement : null,
+    skipped: false,
+    surfaceType
+  };
+}
+
 function splitPrimitiveFacesBySurfacesBatch(oc, shape, draftAngleDegrees) {
   const diagnostics = {
     apexConeFaceDivide: [],
@@ -2031,6 +2404,311 @@ function splitPrimitiveFacesBySurfacesBatch(oc, shape, draftAngleDegrees) {
   }
 }
 
+function faceAtIndex(oc, shape, targetIndex) {
+  const explorer = makeExplorer(oc, shape, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_FACE'));
+  let faceIndex = 0;
+
+  for (; callAny(explorer, ['More']); callAny(explorer, ['Next'])) {
+    const face = faceFromExplorer(oc, explorer);
+
+    if (faceIndex === targetIndex) {
+      return face;
+    }
+
+    faceIndex += 1;
+  }
+
+  return null;
+}
+
+function collectFaceJobs(oc, shape) {
+  const jobs = [];
+  const explorer = makeExplorer(oc, shape, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_FACE'));
+  let faceIndex = 0;
+
+  for (; callAny(explorer, ['More']); callAny(explorer, ['Next'])) {
+    const face = faceFromExplorer(oc, explorer);
+    const faceSurface = makeInstance(oc, 'BRepAdaptor_Surface', [face, true]);
+    const surfaceType = getSurfaceType(oc, faceSurface);
+
+    jobs.push({
+      faceIndex,
+      faceKey: shapeKey(face, faceIndex),
+      surfaceType
+    });
+    faceIndex += 1;
+  }
+
+  const priority = {
+    bspline: 0,
+    bezier: 0,
+    torus: 1,
+    cone: 2,
+    cylinder: 3,
+    sphere: 3,
+    plane: 4,
+    generic: 5
+  };
+
+  return jobs.sort((left, right) => (
+    (priority[left.surfaceType] ?? 10) - (priority[right.surfaceType] ?? 10) ||
+    left.faceIndex - right.faceIndex
+  ));
+}
+
+function applyReplacementMap(oc, shape, faces, replacements) {
+  if (replacements.size === 0) {
+    return shape;
+  }
+
+  const reshaper = makeInstance(oc, 'BRepTools_ReShape');
+
+  for (const [faceIndex, replacement] of replacements.entries()) {
+    const face = faces[faceIndex];
+
+    if (face) {
+      callAny(reshaper, ['Replace'], [face, replacement]);
+    }
+  }
+
+  const result = callAny(reshaper, ['Apply'], [shape, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_FACE')]);
+  return callAny(result, ['IsNull']) ? shape : result;
+}
+
+function collectFaces(oc, shape) {
+  const faces = [];
+  const explorer = makeExplorer(oc, shape, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_FACE'));
+
+  for (; callAny(explorer, ['More']); callAny(explorer, ['Next'])) {
+    faces.push(faceFromExplorer(oc, explorer));
+  }
+
+  return faces;
+}
+
+function workerCountForJobs(jobCount, requestedCount) {
+  if (jobCount <= 0 || typeof Worker === 'undefined') {
+    return 0;
+  }
+
+  const hardwareCount = typeof navigator !== 'undefined' && Number.isFinite(navigator.hardwareConcurrency)
+    ? navigator.hardwareConcurrency
+    : 4;
+  const defaultCount = Math.max(1, Math.min(8, hardwareCount - 1 || 1));
+  return Math.max(1, Math.min(jobCount, requestedCount || defaultCount));
+}
+
+const WORKER_RENDER_INTERVAL_MS = 250;
+
+async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegrees, options = {}) {
+  const jobs = collectFaceJobs(oc, shape);
+  const workerCount = workerCountForJobs(jobs.length, options.workerCount);
+
+  if (workerCount === 0) {
+    return splitPrimitiveFacesBySurfacesBatch(oc, shape, draftAngleDegrees);
+  }
+
+  const diagnostics = createSplitDiagnostics();
+  const failedSplitFaceKeys = new Set();
+  const replacements = new Map();
+  let streamedReplacementCount = 0;
+  let nextJobIndex = 0;
+  let completedJobs = 0;
+  let activeWorkers = 0;
+  let settled = false;
+
+  return new Promise((resolve, reject) => {
+    const workers = [];
+    const renderTimer = setInterval(() => {
+      try {
+        if (settled || replacements.size === streamedReplacementCount) {
+          return;
+        }
+
+        const snapshotShape = readStepShape(oc, buffer);
+        const snapshotFaces = collectFaces(oc, snapshotShape);
+        const currentShape = applyReplacementMap(oc, snapshotShape, snapshotFaces, replacements);
+
+        streamedReplacementCount = replacements.size;
+        options.onProgress?.({
+          completedFaces: completedJobs,
+          currentShape,
+          replacementFaces: replacements.size,
+          totalFaces: jobs.length,
+          workers: workerCount
+        });
+      } catch (error) {
+        settled = true;
+        cleanup();
+        reject(error);
+      }
+    }, WORKER_RENDER_INTERVAL_MS);
+
+    function cleanup() {
+      clearInterval(renderTimer);
+
+      for (const worker of workers) {
+        worker.terminate();
+      }
+    }
+
+    function finishIfDone() {
+      if (settled || completedJobs < jobs.length || activeWorkers > 0) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+
+      const finalBaseShape = readStepShape(oc, buffer);
+      const finalFaces = collectFaces(oc, finalBaseShape);
+      const finalShape = applyReplacementMap(oc, finalBaseShape, finalFaces, replacements);
+      options.onProgress?.({
+        completedFaces: completedJobs,
+        replacementFaces: replacements.size,
+        totalFaces: jobs.length,
+        workers: workerCount
+      });
+      resolve({
+        diagnostics,
+        failedSplitFaceKeys,
+        shape: finalShape
+      });
+    }
+
+    function assignJob(worker) {
+      if (settled) {
+        return;
+      }
+
+      const job = jobs[nextJobIndex];
+
+      if (!job) {
+        worker.postMessage({ type: 'idle' });
+        finishIfDone();
+        return;
+      }
+
+      nextJobIndex += 1;
+      activeWorkers += 1;
+      worker.postMessage({
+        draftAngleDegrees,
+        faceIndex: job.faceIndex,
+        jobId: job.faceIndex,
+        type: 'process-face'
+      });
+    }
+
+    function handleWorkerResult(worker, message) {
+      activeWorkers -= 1;
+      completedJobs += 1;
+
+      if (message.diagnostics) {
+        mergeSplitDiagnostics(diagnostics, message.diagnostics);
+      }
+
+      for (const faceKey of message.failedFaceKeys || []) {
+        failedSplitFaceKeys.add(faceKey);
+      }
+
+      if (message.brepText) {
+        const replacement = readBrepShape(oc, message.brepText);
+        replacements.set(message.faceIndex, replacement);
+      }
+
+      options.onProgress?.({
+        completedFaces: completedJobs,
+        lastFaceIndex: message.faceIndex,
+        lastSurfaceType: message.surfaceType,
+        replacementFaces: replacements.size,
+        totalFaces: jobs.length,
+        workers: workerCount
+      });
+      assignJob(worker);
+      finishIfDone();
+    }
+
+    for (let index = 0; index < workerCount; index += 1) {
+      const worker = new Worker(new URL('./occtWorker.js', import.meta.url));
+      workers.push(worker);
+
+      worker.addEventListener('message', (event) => {
+        const message = event.data || {};
+
+        if (settled) {
+          return;
+        }
+
+        if (message.type === 'ready') {
+          assignJob(worker);
+          return;
+        }
+
+        if (message.type === 'result') {
+          try {
+            handleWorkerResult(worker, message);
+          } catch (error) {
+            settled = true;
+            cleanup();
+            reject(error);
+          }
+          return;
+        }
+
+        if (message.type === 'error') {
+          settled = true;
+          cleanup();
+          reject(new Error(message.error || 'OCCT worker failed.'));
+        }
+      });
+
+      worker.addEventListener('error', (error) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        reject(error.error || new Error(error.message || 'OCCT worker failed.'));
+      });
+
+      worker.postMessage({
+        buffer,
+        draftAngleDegrees,
+        type: 'init'
+      });
+    }
+  });
+}
+
+export async function createStepFaceProcessor(buffer) {
+  const oc = await getOpenCascade();
+  const shape = readStepShape(oc, buffer);
+
+  return {
+    processFace(faceIndex, draftAngleDegrees) {
+      const face = faceAtIndex(oc, shape, faceIndex);
+
+      if (!face) {
+        throw new Error(`Worker could not find face index ${faceIndex}.`);
+      }
+
+      const result = splitSingleFaceBySurfaces(oc, face, face, faceIndex, draftAngleDegrees);
+      const brepText = result.replacement ? writeBrepShape(oc, result.replacement) : null;
+
+      return {
+        brepText,
+        diagnostics: result.diagnostics,
+        faceIndex,
+        faceKey: result.faceKey,
+        failedFaceKeys: Array.from(result.failedSplitFaceKeys),
+        skipped: result.skipped,
+        surfaceType: result.surfaceType
+      };
+    }
+  };
+}
+
 function pointToArray(point) {
   return [getCoord(point, 'X'), getCoord(point, 'Y'), getCoord(point, 'Z')];
 }
@@ -2298,13 +2976,7 @@ function collectBoundaryLines(oc, shape) {
   return positions;
 }
 
-export async function loadStepWithOpenCascade(buffer, draftAngleDegrees) {
-  const oc = await getOpenCascade();
-  let shape = readStepShape(oc, buffer);
-
-  const splitResult = splitPrimitiveFacesBySurfacesBatch(oc, shape, draftAngleDegrees);
-  shape = splitResult.shape;
-  const splitStepText = writeStepShape(oc, shape);
+function buildRenderModelFromShape(oc, shape, splitResult, splitStepText = null) {
   cleanTriangulation(oc, shape);
 
   const output = {
@@ -2370,4 +3042,40 @@ export async function loadStepWithOpenCascade(buffer, draftAngleDegrees) {
     splitStepText,
     totalFaces: faceIndex
   };
+}
+
+export async function loadStepWithOpenCascade(buffer, draftAngleDegrees, options = {}) {
+  const oc = await getOpenCascade();
+  let shape = readStepShape(oc, buffer);
+  options.onInitialModel?.(buildRenderModelFromShape(oc, shape, {
+    diagnostics: createSplitDiagnostics()
+  }));
+
+  let splitResult;
+
+  if (options.useWorkers !== false && typeof Worker !== 'undefined') {
+    try {
+      splitResult = await splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegrees, {
+        ...options,
+        onProgress: (progress) => {
+          options.onProgress?.(progress);
+
+          if (progress.currentShape && options.onPartialModel) {
+            options.onPartialModel(buildRenderModelFromShape(oc, progress.currentShape, {
+              diagnostics: createSplitDiagnostics()
+            }));
+          }
+        }
+      });
+    } catch (error) {
+      console.warn('Worker-based OCCT splitting failed; falling back to single-thread batch split.', error);
+      splitResult = splitPrimitiveFacesBySurfacesBatch(oc, shape, draftAngleDegrees);
+    }
+  } else {
+    splitResult = splitPrimitiveFacesBySurfacesBatch(oc, shape, draftAngleDegrees);
+  }
+
+  shape = splitResult.shape;
+  const splitStepText = writeStepShape(oc, shape);
+  return buildRenderModelFromShape(oc, shape, splitResult, splitStepText);
 }

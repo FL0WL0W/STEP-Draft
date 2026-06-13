@@ -396,7 +396,7 @@ function frameModel() {
   grid.scale.setScalar(Math.max(Math.ceil(Math.max(size.x, size.y) / 300), 1));
 }
 
-function renderLoadedModel() {
+function renderLoadedModel({ frame = true } = {}) {
   if (!currentModel) {
     return;
   }
@@ -417,7 +417,10 @@ function renderLoadedModel() {
     { boundarySegments: 0, failedTriangles: 0, failedFaces: 0, mixedFaces: 0, totalFaces: 0 }
   );
 
-  frameModel();
+  if (frame) {
+    frameModel();
+  }
+
   emptyState.classList.add('is-hidden');
   const splitSummary = summarizeSplitDiagnostics(currentModel.splitDiagnostics);
 
@@ -442,6 +445,15 @@ function summarizeSplitDiagnostics(diagnostics) {
   return parts.length > 0 ? `; splits - ${parts.join('; ')}` : '';
 }
 
+function progressLabel(progress, fileName) {
+  if (!progress?.totalFaces) {
+    return `Splitting ${fileName} with OCCT workers...`;
+  }
+
+  const last = progress.lastSurfaceType ? `; last ${progress.lastSurfaceType} face ${progress.lastFaceIndex}` : '';
+  return `Splitting ${fileName} with ${progress.workers} OCCT workers - ${progress.completedFaces}/${progress.totalFaces} faces, ${progress.replacementFaces} replacements${last}`;
+}
+
 async function updateDraftAnalysis() {
   if (!currentModel?.buffer) {
     return;
@@ -451,7 +463,37 @@ async function updateDraftAnalysis() {
   const draftAngle = getDraftAngle();
   setStatus(`Evaluating analytic OCCT surfaces at ${draftAngle} degrees...`);
 
-  const draftAnalysis = await loadStepWithOpenCascade(currentModel.buffer, draftAngle);
+  const draftAnalysis = await loadStepWithOpenCascade(currentModel.buffer, draftAngle, {
+    onInitialModel: (initialModel) => {
+      if (version !== draftAnalysisVersion) {
+        return;
+      }
+
+      currentModel.failedFaceIndices = initialModel.failedFaceIndices;
+      currentModel.mixedFaceIndices = initialModel.mixedFaceIndices;
+      currentModel.meshes = initialModel.meshes;
+      currentModel.splitDiagnostics = initialModel.splitDiagnostics;
+      currentModel.analyzedFaceCount = initialModel.totalFaces;
+      renderLoadedModel();
+    },
+    onPartialModel: (partialModel) => {
+      if (version !== draftAnalysisVersion) {
+        return;
+      }
+
+      currentModel.failedFaceIndices = partialModel.failedFaceIndices;
+      currentModel.mixedFaceIndices = partialModel.mixedFaceIndices;
+      currentModel.meshes = partialModel.meshes;
+      currentModel.splitDiagnostics = partialModel.splitDiagnostics;
+      currentModel.analyzedFaceCount = partialModel.totalFaces;
+      renderLoadedModel({ frame: false });
+    },
+    onProgress: (progress) => {
+      if (version === draftAnalysisVersion) {
+        setStatus(progressLabel(progress, currentModel.fileName));
+      }
+    }
+  });
 
   if (version !== draftAnalysisVersion) {
     return;
@@ -470,7 +512,38 @@ async function loadStepBuffer(buffer, fileName) {
   clearModel();
   setStatus(`Loading ${fileName} with OpenCascade...`);
 
-  const result = await loadStepWithOpenCascade(buffer, getDraftAngle());
+  currentModel = {
+    fileName,
+    buffer,
+    meshes: [],
+    failedFaceIndices: new Set(),
+    mixedFaceIndices: new Set(),
+    splitStepText: null,
+    splitDiagnostics: null,
+    analyzedFaceCount: 0
+  };
+
+  const result = await loadStepWithOpenCascade(buffer, getDraftAngle(), {
+    onInitialModel: (initialModel) => {
+      currentModel.meshes = initialModel.meshes;
+      currentModel.failedFaceIndices = initialModel.failedFaceIndices;
+      currentModel.mixedFaceIndices = initialModel.mixedFaceIndices;
+      currentModel.splitDiagnostics = initialModel.splitDiagnostics;
+      currentModel.analyzedFaceCount = initialModel.totalFaces;
+      renderLoadedModel();
+    },
+    onPartialModel: (partialModel) => {
+      currentModel.meshes = partialModel.meshes;
+      currentModel.failedFaceIndices = partialModel.failedFaceIndices;
+      currentModel.mixedFaceIndices = partialModel.mixedFaceIndices;
+      currentModel.splitDiagnostics = partialModel.splitDiagnostics;
+      currentModel.analyzedFaceCount = partialModel.totalFaces;
+      renderLoadedModel({ frame: false });
+    },
+    onProgress: (progress) => {
+      setStatus(progressLabel(progress, fileName));
+    }
+  });
   const meshes = result.meshes || [];
 
   currentModel = {
