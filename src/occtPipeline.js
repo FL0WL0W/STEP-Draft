@@ -429,6 +429,14 @@ function getSurfaceType(oc, surface) {
     return 'torus';
   }
 
+  if (type === enumValue(oc, 'GeomAbs_SurfaceType', 'GeomAbs_BSplineSurface')) {
+    return 'bspline';
+  }
+
+  if (type === enumValue(oc, 'GeomAbs_SurfaceType', 'GeomAbs_BezierSurface')) {
+    return 'bezier';
+  }
+
   return 'generic';
 }
 
@@ -440,11 +448,282 @@ function vectorDot(left, right) {
   return left[0] * right[0] + left[1] * right[1] + left[2] * right[2];
 }
 
+function vectorAdd(left, right) {
+  return [
+    left[0] + right[0],
+    left[1] + right[1],
+    left[2] + right[2]
+  ];
+}
+
+function vectorScale(vector, factor) {
+  return [
+    vector[0] * factor,
+    vector[1] * factor,
+    vector[2] * factor
+  ];
+}
+
 function axisToData(axis) {
   return {
     location: pointToArray(callAny(axis, ['Location'])),
     direction: directionToArray(callAny(axis, ['Direction']))
   };
+}
+
+function isGeneralSurfaceType(surfaceType) {
+  return surfaceType === 'bspline' || surfaceType === 'bezier';
+}
+
+function evaluateSurfacePointAndNormal(oc, surface, u, v, forward) {
+  const point = pointToArray(callAny(surface, ['Value'], [u, v]));
+  const normal = normalFromDerivatives(oc, surface, u, v, forward);
+
+  return {
+    normal: [normal.nx, normal.ny, normal.nz],
+    point
+  };
+}
+
+function connectUvSegments(segments, tolerance) {
+  const contours = [];
+  const remaining = segments.map((segment) => [segment[0], segment[1]]);
+
+  function uvDistance(a, b) {
+    return Math.hypot(a[0] - b[0], a[1] - b[1]);
+  }
+
+  while (remaining.length > 0) {
+    const contour = remaining.pop();
+    let grew = true;
+
+    while (grew) {
+      grew = false;
+
+      for (let index = remaining.length - 1; index >= 0; index -= 1) {
+        const segment = remaining[index];
+        const first = contour[0];
+        const last = contour[contour.length - 1];
+        const start = segment[0];
+        const end = segment[1];
+
+        if (uvDistance(last, start) <= tolerance) {
+          contour.push(end);
+        } else if (uvDistance(last, end) <= tolerance) {
+          contour.push(start);
+        } else if (uvDistance(first, end) <= tolerance) {
+          contour.unshift(start);
+        } else if (uvDistance(first, start) <= tolerance) {
+          contour.unshift(end);
+        } else {
+          continue;
+        }
+
+        remaining.splice(index, 1);
+        grew = true;
+      }
+    }
+
+    contours.push(contour);
+  }
+
+  return contours;
+}
+
+function densifyUvContour(contour, targetCount = 8) {
+  if (contour.length >= targetCount) {
+    return contour;
+  }
+
+  const dense = [];
+
+  for (let index = 0; index < contour.length - 1; index += 1) {
+    const start = contour[index];
+    const end = contour[index + 1];
+    const steps = Math.max(1, Math.ceil(targetCount / Math.max(1, contour.length - 1)));
+
+    for (let step = 0; step < steps; step += 1) {
+      const t = step / steps;
+      dense.push([
+        start[0] + (end[0] - start[0]) * t,
+        start[1] + (end[1] - start[1]) * t
+      ]);
+    }
+  }
+
+  dense.push(contour[contour.length - 1]);
+  return dense;
+}
+
+function findGeneralSurfaceSplitSurfaces(oc, face, faceSurface, draftAngleDegrees) {
+  const uMin = callAny(faceSurface, ['FirstUParameter']);
+  const uMax = callAny(faceSurface, ['LastUParameter']);
+  const vMin = callAny(faceSurface, ['FirstVParameter']);
+  const vMax = callAny(faceSurface, ['LastVParameter']);
+
+  if (![uMin, uMax, vMin, vMax].every(Number.isFinite) || uMax <= uMin || vMax <= vMin) {
+    return [];
+  }
+
+  const threshold = Math.sin((draftAngleDegrees * Math.PI) / 180);
+  const forward = shapeOrientation(face) !== enumValue(oc, 'TopAbs_Orientation', 'TopAbs_REVERSED');
+  const uCount = 17;
+  const vCount = 17;
+  const values = [];
+  const samples = [];
+
+  for (let uIndex = 0; uIndex < uCount; uIndex += 1) {
+    const u = uMin + ((uMax - uMin) * uIndex) / (uCount - 1);
+    const valueRow = [];
+    const sampleRow = [];
+
+    for (let vIndex = 0; vIndex < vCount; vIndex += 1) {
+      const v = vMin + ((vMax - vMin) * vIndex) / (vCount - 1);
+
+      try {
+        const sample = evaluateSurfacePointAndNormal(oc, faceSurface, u, v, forward);
+        valueRow.push(sample.normal[2] - threshold);
+        sampleRow.push(sample);
+      } catch {
+        valueRow.push(Number.NaN);
+        sampleRow.push(null);
+      }
+    }
+
+    values.push(valueRow);
+    samples.push(sampleRow);
+  }
+
+  const segments = [];
+
+  function interpolateUv(a, b, valueA, valueB) {
+    const denominator = valueA - valueB;
+    const t = Math.abs(denominator) <= 1e-12 ? 0.5 : valueA / denominator;
+
+    return [
+      a[0] + (b[0] - a[0]) * Math.min(Math.max(t, 0), 1),
+      a[1] + (b[1] - a[1]) * Math.min(Math.max(t, 0), 1)
+    ];
+  }
+
+  for (let uIndex = 0; uIndex < uCount - 1; uIndex += 1) {
+    for (let vIndex = 0; vIndex < vCount - 1; vIndex += 1) {
+      const corners = [
+        {
+          uv: [
+            uMin + ((uMax - uMin) * uIndex) / (uCount - 1),
+            vMin + ((vMax - vMin) * vIndex) / (vCount - 1)
+          ],
+          value: values[uIndex][vIndex]
+        },
+        {
+          uv: [
+            uMin + ((uMax - uMin) * (uIndex + 1)) / (uCount - 1),
+            vMin + ((vMax - vMin) * vIndex) / (vCount - 1)
+          ],
+          value: values[uIndex + 1][vIndex]
+        },
+        {
+          uv: [
+            uMin + ((uMax - uMin) * (uIndex + 1)) / (uCount - 1),
+            vMin + ((vMax - vMin) * (vIndex + 1)) / (vCount - 1)
+          ],
+          value: values[uIndex + 1][vIndex + 1]
+        },
+        {
+          uv: [
+            uMin + ((uMax - uMin) * uIndex) / (uCount - 1),
+            vMin + ((vMax - vMin) * (vIndex + 1)) / (vCount - 1)
+          ],
+          value: values[uIndex][vIndex + 1]
+        }
+      ];
+
+      if (corners.some((corner) => !Number.isFinite(corner.value))) {
+        continue;
+      }
+
+      const crossings = [];
+
+      for (const [leftIndex, rightIndex] of [[0, 1], [1, 2], [2, 3], [3, 0]]) {
+        const left = corners[leftIndex];
+        const right = corners[rightIndex];
+
+        if (left.value === 0) {
+          crossings.push(left.uv);
+        }
+
+        if (left.value * right.value < 0) {
+          crossings.push(interpolateUv(left.uv, right.uv, left.value, right.value));
+        }
+      }
+
+      if (crossings.length === 2) {
+        segments.push([crossings[0], crossings[1]]);
+      } else if (crossings.length === 4) {
+        segments.push([crossings[0], crossings[1]], [crossings[2], crossings[3]]);
+      }
+
+      if (segments.length > 180) {
+        break;
+      }
+    }
+
+    if (segments.length > 180) {
+      break;
+    }
+  }
+
+  if (segments.length === 0) {
+    return [];
+  }
+
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+
+  for (const row of samples) {
+    for (const sample of row) {
+      if (!sample) {
+        continue;
+      }
+
+      minX = Math.min(minX, sample.point[0]);
+      minY = Math.min(minY, sample.point[1]);
+      minZ = Math.min(minZ, sample.point[2]);
+      maxX = Math.max(maxX, sample.point[0]);
+      maxY = Math.max(maxY, sample.point[1]);
+      maxZ = Math.max(maxZ, sample.point[2]);
+    }
+  }
+
+  const diagonal = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ);
+  const normalOffset = Math.max(diagonal * 0.08, 1);
+  const uvTolerance = Math.hypot((uMax - uMin) / (uCount - 1), (vMax - vMin) / (vCount - 1)) * 1.5;
+  const contours = connectUvSegments(segments, uvTolerance)
+    .map((contour) => densifyUvContour(contour))
+    .filter((contour) => contour.length >= 4)
+    .slice(0, 2);
+
+  return contours.map((contour) => {
+    const points = [];
+
+    for (const [u, v] of contour) {
+      const sample = evaluateSurfacePointAndNormal(oc, faceSurface, u, v, forward);
+      points.push([-2, 0, 2].map((factor) => (
+        vectorAdd(sample.point, vectorScale(sample.normal, factor * normalOffset))
+      )));
+    }
+
+    return {
+      contourPoints: contour.length,
+      points,
+      type: 'pointGridSurface'
+    };
+  });
 }
 
 function faceBoundaryTouchesPoint(oc, face, target, tolerance) {
@@ -529,6 +808,10 @@ function primitiveSplitSurfacesForFace(oc, face, draftAngleDegrees) {
       minorRadius,
       normalDirection
     }, draftAngleDegrees);
+  }
+
+  if (surfaceType === 'bspline' || surfaceType === 'bezier') {
+    return findGeneralSurfaceSplitSurfaces(oc, face, surface, draftAngleDegrees);
   }
 
   return [];
@@ -770,8 +1053,7 @@ function sectionFaceWithSplitSurface(oc, face, splitSurface) {
   }
 
   if (splitSurface.type === 'pointGridSurface') {
-    const surfaceHandle = makeBSplineSurfaceFromPointGrid(oc, splitSurface.points);
-    return surfaceHandle ? sectionFaceWithGeomSurface(oc, face, surfaceHandle) : [];
+    return [];
   }
 
   return [];
@@ -1444,10 +1726,7 @@ function tryFaceDivideApexCone(oc, shape, face, faceSurface, splitSurfaces) {
   }
 }
 
-function splitPrimitiveFacesBySurfaces(oc, shape, draftAngleDegrees) {
-  let currentShape = shape;
-  const failedSplitFaceKeys = new Set();
-  const skippedFaces = new Set();
+function splitPrimitiveFacesBySurfacesBatch(oc, shape, draftAngleDegrees) {
   const diagnostics = {
     apexConeFaceDivide: [],
     coneBoundaryChecks: [],
@@ -1459,7 +1738,8 @@ function splitPrimitiveFacesBySurfaces(oc, shape, draftAngleDegrees) {
     totalSplitAttempts: 0,
     successfulSplits: 0
   };
-  const maxSplits = 120;
+  const failedSplitFaceKeys = new Set();
+  const replacements = [];
 
   function surfaceStats(surfaceType) {
     if (!diagnostics.totals[surfaceType]) {
@@ -1476,390 +1756,237 @@ function splitPrimitiveFacesBySurfaces(oc, shape, draftAngleDegrees) {
     return diagnostics.totals[surfaceType];
   }
 
-  function acceptedSplit(result, beforeFaceCount) {
-    return result && countFaces(oc, result) > beforeFaceCount;
+  function acceptedReplacement(replacement) {
+    return replacement && countFaces(oc, replacement) > 1;
   }
 
-  for (let splitIndex = 0; splitIndex < maxSplits; splitIndex += 1) {
-    const explorer = makeExplorer(oc, currentShape, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_FACE'));
-    const beforeFaceCount = countFaces(oc, currentShape);
-    let faceIndex = 0;
-    let appliedSplit = false;
-    const candidates = [];
+  const explorer = makeExplorer(oc, shape, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_FACE'));
+  let faceIndex = 0;
 
-    for (; callAny(explorer, ['More']); callAny(explorer, ['Next'])) {
-      const face = faceFromExplorer(oc, explorer);
-      const faceKey = shapeKey(face, faceIndex);
-      const skipKey = `${beforeFaceCount}:${faceKey}`;
+  for (; callAny(explorer, ['More']); callAny(explorer, ['Next'])) {
+    const face = faceFromExplorer(oc, explorer);
+    const faceKey = shapeKey(face, faceIndex);
+    const faceSurface = makeInstance(oc, 'BRepAdaptor_Surface', [face, true]);
+    const surfaceType = getSurfaceType(oc, faceSurface);
+    const splitSurfaces = primitiveSplitSurfacesForFace(oc, face, draftAngleDegrees);
+    const stats = surfaceStats(surfaceType);
+    const edges = [];
+    const tools = [];
+    const methodResults = [];
+    let coneBoundaryTouchesApex = false;
 
+    if (splitSurfaces.length === 0) {
       faceIndex += 1;
+      continue;
+    }
 
-      if (skippedFaces.has(skipKey)) {
-        continue;
+    if (surfaceType === 'cone') {
+      try {
+        const cone = callAny(faceSurface, ['Cone']);
+        const apex = pointToArray(callAny(cone, ['Apex']));
+        const refRadius = callAny(cone, ['RefRadius']);
+        const apexTolerance = Math.max(1e-6, Math.abs(refRadius) * 1e-5, distanceBetween(apex, pointToArray(callAny(cone, ['Location']))) * 1e-7);
+        coneBoundaryTouchesApex = faceBoundaryTouchesPoint(oc, face, apex, apexTolerance);
+      } catch {
+        coneBoundaryTouchesApex = false;
       }
+    }
 
-      const faceSurface = makeInstance(oc, 'BRepAdaptor_Surface', [face, true]);
-      const surfaceType = getSurfaceType(oc, faceSurface);
-      const splitSurfaces = primitiveSplitSurfacesForFace(oc, face, draftAngleDegrees);
-      const stats = surfaceStats(surfaceType);
-      const edges = [];
-      const tools = [];
-      const originalBoundaryEdges = surfaceType === 'cone' ? collectShapeEdges(oc, face) : [];
-      let coneBoundaryTouchesApex = false;
-
-      if (splitSurfaces.length > 0) {
-        if (surfaceType === 'cone') {
-          try {
-            const cone = callAny(faceSurface, ['Cone']);
-            const apex = pointToArray(callAny(cone, ['Apex']));
-            const refRadius = callAny(cone, ['RefRadius']);
-            const apexTolerance = Math.max(1e-6, Math.abs(refRadius) * 1e-5, distanceBetween(apex, pointToArray(callAny(cone, ['Location']))) * 1e-7);
-            coneBoundaryTouchesApex = faceBoundaryTouchesPoint(oc, face, apex, apexTolerance);
-          } catch {
-            coneBoundaryTouchesApex = false;
-          }
-        }
-
-        stats.faces += 1;
-        stats.splitSurfaces += splitSurfaces.length;
-        diagnostics.generatedSurfaces.push({
-          coneBoundaryTouchesApex,
-          faceIndex: faceIndex - 1,
-          surfaceType,
-          splitSurfaces: splitSurfaces.map((splitSurface) => {
-            if (splitSurface.type === 'plane') {
-              return {
-                point: splitSurface.point,
-                bnormal: splitSurface.normal,
-                type: splitSurface.type
-              };
-            }
-
-            return {
-              columns: splitSurface.points?.[0]?.length || 0,
-              rows: splitSurface.points?.length || 0,
-              type: splitSurface.type
-            };
-          })
-        });
-      }
-
-      for (const splitSurface of splitSurfaces) {
-        const sectionEdges = sectionFaceWithSplitSurface(oc, face, splitSurface);
-
-        stats.sectionEdges += sectionEdges.length;
-
-        for (const edge of sectionEdges) {
-          edges.push(edge);
-        }
-
-        const toolFace = makeToolFaceFromSplitSurface(oc, splitSurface);
-
-        if (toolFace) {
-          tools.push(toolFace);
-          stats.toolFaces += 1;
-        }
-      }
-
-      if (surfaceType === 'torus' && splitSurfaces.length > 0) {
-        diagnostics.torusSplits.push({
-          faceIndex: faceIndex - 1,
-          faceKey,
-          phase: 'candidate-built',
-          sectionEdges: edges.length,
-          splitSurfaces: splitSurfaces.map((splitSurface) => ({
-            columns: splitSurface.points?.[0]?.length || null,
-            rows: splitSurface.points?.length || null,
+    stats.faces += 1;
+    stats.splitSurfaces += splitSurfaces.length;
+    diagnostics.generatedSurfaces.push({
+      coneBoundaryTouchesApex,
+      faceIndex,
+      surfaceType,
+      splitSurfaces: splitSurfaces.map((splitSurface) => {
+        if (splitSurface.type === 'plane') {
+          return {
+            point: splitSurface.point,
+            bnormal: splitSurface.normal,
             type: splitSurface.type
-          })),
-          toolFaces: tools.length
-        });
-      }
-
-      if (edges.length === 0 && tools.length === 0 && !(surfaceType === 'cone' && coneBoundaryTouchesApex)) {
-        skippedFaces.add(skipKey);
-        if (splitSurfaces.length > 0) {
-          diagnostics.failedCandidates.push({
-            faceIndex: faceIndex - 1,
-            reason: 'No section edges or tool faces were produced',
-            splitSurfaces: splitSurfaces.length,
-            surfaceType
-          });
-          stats.failedCandidates += 1;
+          };
         }
-        continue;
-      }
 
-      candidates.push({
-        coneBoundaryTouchesApex,
-        edges,
-        face,
-        faceIndex: faceIndex - 1,
+        return {
+          columns: splitSurface.points?.[0]?.length || 0,
+          rows: splitSurface.points?.length || 0,
+          type: splitSurface.type
+        };
+      })
+    });
+
+    for (const splitSurface of splitSurfaces) {
+      const sectionEdges = sectionFaceWithSplitSurface(oc, face, splitSurface);
+
+      stats.sectionEdges += sectionEdges.length;
+      edges.push(...sectionEdges);
+
+      const toolFace = makeToolFaceFromSplitSurface(oc, splitSurface);
+
+      if (toolFace) {
+        tools.push(toolFace);
+        stats.toolFaces += 1;
+      }
+    }
+
+    if (surfaceType === 'torus') {
+      diagnostics.torusSplits.push({
+        faceIndex,
         faceKey,
-        faceSurface,
-        originalBoundaryEdges,
-        skipKey,
-        splitSurfaces,
-        surfaceType,
-        tools
+        phase: 'candidate-built',
+        sectionEdges: edges.length,
+        splitSurfaces: splitSurfaces.map((splitSurface) => ({
+          columns: splitSurface.points?.[0]?.length || null,
+          rows: splitSurface.points?.length || null,
+          type: splitSurface.type
+        })),
+        toolFaces: tools.length
       });
     }
 
-    for (const candidate of candidates) {
-      const {
-        coneBoundaryTouchesApex,
-        edges,
-        face,
+    if (edges.length === 0 && tools.length === 0 && !(surfaceType === 'cone' && coneBoundaryTouchesApex)) {
+      failedSplitFaceKeys.add(faceKey);
+      diagnostics.failedCandidates.push({
         faceIndex,
         faceKey,
-        faceSurface,
-        originalBoundaryEdges,
-        skipKey,
-        splitSurfaces,
+        reason: 'No section edges or tool faces were produced',
+        splitSurfaces: splitSurfaces.length,
+        surfaceType
+      });
+      stats.failedCandidates += 1;
+      faceIndex += 1;
+      continue;
+    }
+
+    diagnostics.totalSplitAttempts += 1;
+    let replacement = null;
+    const wireGroups = splitEdgeGroupsForWires(oc, edges);
+
+    if (surfaceType === 'cone' && coneBoundaryTouchesApex) {
+      const faceDivideResult = tryFaceDivideApexCone(oc, face, face, faceSurface, splitSurfaces);
+      replacement = faceDivideResult.shape;
+      methodResults.push({
+        attempts: faceDivideResult.attempts,
+        error: faceDivideResult.error,
+        method: 'cone-apex-face-divide-u-split',
+        resultFaces: faceDivideResult.resultFaces,
+        success: acceptedReplacement(replacement),
+        uSplitValues: faceDivideResult.uSplitValues
+      });
+      diagnostics.apexConeFaceDivide.push({
+        attempts: faceDivideResult.attempts,
+        bounds: faceDivideResult.bounds,
+        error: faceDivideResult.error,
+        faceIndex,
+        faceKey,
+        resultFaces: faceDivideResult.resultFaces,
+        success: acceptedReplacement(replacement),
+        uSplitValues: faceDivideResult.uSplitValues
+      });
+
+      if (!acceptedReplacement(replacement)) {
+        replacement = null;
+      }
+    }
+
+    if (!replacement && wireGroups.length > 0) {
+      replacement = trySplitFaceWithWires(oc, face, face, wireGroups.map((group) => group.wire));
+      methodResults.push({
+        method: 'split-face-wires',
+        resultFaces: replacement ? countFaces(oc, replacement) : null,
+        success: acceptedReplacement(replacement),
+        wireTools: wireGroups.length
+      });
+
+      if (!acceptedReplacement(replacement)) {
+        replacement = null;
+      }
+    }
+
+    if (!replacement && wireGroups.length > 0) {
+      replacement = trySplitFaceWithWires(oc, face, face, wireGroups.map((group) => group.wire), false);
+      methodResults.push({
+        method: 'split-face-wires-relaxed-boundary',
+        resultFaces: replacement ? countFaces(oc, replacement) : null,
+        success: acceptedReplacement(replacement),
+        wireTools: wireGroups.length
+      });
+
+      if (!acceptedReplacement(replacement)) {
+        replacement = null;
+      }
+    }
+
+    if (!replacement && edges.length > 0) {
+      replacement = trySplitFaceWithEdges(oc, face, face, edges);
+      methodResults.push({
+        method: 'split-face-edges',
+        resultFaces: replacement ? countFaces(oc, replacement) : null,
+        success: acceptedReplacement(replacement)
+      });
+
+      if (!acceptedReplacement(replacement)) {
+        replacement = null;
+      }
+    }
+
+    if (!replacement && edges.length > 0) {
+      replacement = trySplitFaceWithEdges(oc, face, face, edges, false);
+      methodResults.push({
+        method: 'split-face-edges-relaxed-boundary',
+        resultFaces: replacement ? countFaces(oc, replacement) : null,
+        success: acceptedReplacement(replacement)
+      });
+
+      if (!acceptedReplacement(replacement)) {
+        replacement = null;
+      }
+    }
+
+    if (!replacement && (surfaceType === 'torus' || isGeneralSurfaceType(surfaceType)) && tools.length > 0) {
+      replacement = tryBooleanSplitShape(oc, face, tools);
+      methodResults.push({
+        method: `${surfaceType}-face-boolean-tool-split`,
+        resultFaces: replacement ? countFaces(oc, replacement) : null,
+        success: acceptedReplacement(replacement),
+        toolFaces: tools.length
+      });
+
+      if (!acceptedReplacement(replacement)) {
+        replacement = null;
+      }
+    }
+
+    if (surfaceType === 'torus') {
+      diagnostics.torusSplits.push({
+        edgeTools: edges.length,
+        faceIndex,
+        faceKey,
+        methodResults,
+        phase: 'candidate-tried',
+        resultFaces: replacement ? countFaces(oc, replacement) : null,
+        success: acceptedReplacement(replacement),
+        toolFaces: tools.length
+      });
+    }
+
+    if (acceptedReplacement(replacement)) {
+      const successfulMethod = methodResults.find((result) => result.success)?.method || null;
+
+      replacements.push({ face, replacement });
+      diagnostics.successfulCandidates.push({
+        coneBoundaryTouchesApex: surfaceType === 'cone' ? coneBoundaryTouchesApex : undefined,
+        edgeTools: edges.length,
+        faceIndex,
+        faceKey,
+        method: successfulMethod,
+        resultFaces: countFaces(oc, replacement),
         surfaceType,
-        tools
-      } = candidate;
-      const stats = surfaceStats(surfaceType);
-      let nextShape = null;
-      const methodResults = [];
-      const wireGroups = splitEdgeGroupsForWires(oc, edges);
-
-      diagnostics.totalSplitAttempts += 1;
-
-      if (surfaceType === 'cone' && coneBoundaryTouchesApex) {
-        const faceDivideResult = tryFaceDivideApexCone(oc, currentShape, face, faceSurface, splitSurfaces);
-        nextShape = faceDivideResult.shape;
-        diagnostics.apexConeFaceDivide.push({
-          attempts: faceDivideResult.attempts,
-          bounds: faceDivideResult.bounds,
-          error: faceDivideResult.error,
-          faceIndex,
-          faceKey,
-          resultFaces: faceDivideResult.resultFaces,
-          success: acceptedSplit(nextShape, beforeFaceCount),
-          uSplitValues: faceDivideResult.uSplitValues
-        });
-        methodResults.push({
-          attempts: faceDivideResult.attempts,
-          error: faceDivideResult.error,
-          method: 'cone-apex-face-divide-u-split',
-          resultFaces: faceDivideResult.resultFaces,
-          success: acceptedSplit(nextShape, beforeFaceCount),
-          uSplitValues: faceDivideResult.uSplitValues
-        });
-
-        if (!acceptedSplit(nextShape, beforeFaceCount)) {
-          nextShape = null;
-          skippedFaces.add(skipKey);
-          failedSplitFaceKeys.add(faceKey);
-          diagnostics.failedCandidates.push({
-            coneBoundaryTouchesApex,
-            edgeTools: edges.length,
-            faceIndex,
-            faceKey,
-            methodResults,
-            reason: 'Apex cone FaceDivide did not increase face count',
-            surfaceTools: tools.length,
-            surfaceType
-          });
-          stats.failedCandidates += 1;
-          continue;
-        }
-      }
-
-      if (!nextShape && wireGroups.length > 0) {
-        nextShape = trySplitFaceWithWires(oc, currentShape, face, wireGroups.map((group) => group.wire));
-        methodResults.push({
-          method: 'split-shape-wires',
-          resultFaces: nextShape ? countFaces(oc, nextShape) : null,
-          success: acceptedSplit(nextShape, beforeFaceCount),
-          wireTools: wireGroups.length
-        });
-
-        if (!acceptedSplit(nextShape, beforeFaceCount)) {
-          nextShape = null;
-        }
-      }
-
-      if (!nextShape && wireGroups.length > 0) {
-        nextShape = trySplitFaceWithWires(oc, currentShape, face, wireGroups.map((group) => group.wire), false);
-        methodResults.push({
-          method: 'split-shape-wires-relaxed-boundary',
-          resultFaces: nextShape ? countFaces(oc, nextShape) : null,
-          success: acceptedSplit(nextShape, beforeFaceCount),
-          wireTools: wireGroups.length
-        });
-
-        if (!acceptedSplit(nextShape, beforeFaceCount)) {
-          nextShape = null;
-        }
-      }
-
-      if (!nextShape) {
-        for (const group of wireGroups) {
-          nextShape = trySplitFaceWithWires(oc, currentShape, face, [group.wire]);
-          methodResults.push({
-            method: 'split-shape-single-wire',
-            resultFaces: nextShape ? countFaces(oc, nextShape) : null,
-            success: acceptedSplit(nextShape, beforeFaceCount),
-            wireEdges: group.edges.length
-          });
-
-          if (acceptedSplit(nextShape, beforeFaceCount)) {
-            break;
-          }
-
-          nextShape = null;
-        }
-      }
-
-      if (!nextShape) {
-        for (const group of wireGroups) {
-          nextShape = trySplitFaceWithWires(oc, currentShape, face, [group.wire], false);
-          methodResults.push({
-            method: 'split-shape-single-wire-relaxed-boundary',
-            resultFaces: nextShape ? countFaces(oc, nextShape) : null,
-            success: acceptedSplit(nextShape, beforeFaceCount),
-            wireEdges: group.edges.length
-          });
-
-          if (acceptedSplit(nextShape, beforeFaceCount)) {
-            break;
-          }
-
-          nextShape = null;
-        }
-      }
-
-      if (!nextShape && edges.length > 1) {
-        nextShape = trySplitFaceWithEdges(oc, currentShape, face, edges);
-        methodResults.push({
-          method: 'split-shape-all-edges',
-          resultFaces: nextShape ? countFaces(oc, nextShape) : null,
-          success: acceptedSplit(nextShape, beforeFaceCount)
-        });
-
-        if (!acceptedSplit(nextShape, beforeFaceCount)) {
-          nextShape = null;
-        }
-      }
-
-      if (!nextShape && edges.length > 1) {
-        nextShape = trySplitFaceWithEdges(oc, currentShape, face, edges, false);
-        methodResults.push({
-          method: 'split-shape-all-edges-relaxed-boundary',
-          resultFaces: nextShape ? countFaces(oc, nextShape) : null,
-          success: acceptedSplit(nextShape, beforeFaceCount)
-        });
-
-        if (!acceptedSplit(nextShape, beforeFaceCount)) {
-          nextShape = null;
-        }
-      }
-
-      if (!nextShape) {
-        for (const edge of edges) {
-          nextShape = trySplitFaceWithEdges(oc, currentShape, face, [edge]);
-          methodResults.push({
-            method: 'split-shape-single-edge',
-            resultFaces: nextShape ? countFaces(oc, nextShape) : null,
-            success: acceptedSplit(nextShape, beforeFaceCount)
-          });
-
-          if (acceptedSplit(nextShape, beforeFaceCount)) {
-            break;
-          }
-
-          nextShape = null;
-        }
-      }
-
-      if (!nextShape) {
-        for (const edge of edges) {
-          nextShape = trySplitFaceWithEdges(oc, currentShape, face, [edge], false);
-          methodResults.push({
-            method: 'split-shape-single-edge-relaxed-boundary',
-            resultFaces: nextShape ? countFaces(oc, nextShape) : null,
-            success: acceptedSplit(nextShape, beforeFaceCount)
-          });
-
-          if (acceptedSplit(nextShape, beforeFaceCount)) {
-            break;
-          }
-
-          nextShape = null;
-        }
-      }
-
-      if (!nextShape && surfaceType === 'torus' && tools.length > 0) {
-        nextShape = tryBooleanSplitFaceIntoShape(oc, currentShape, face, tools);
-        methodResults.push({
-          method: 'torus-face-boolean-tool-split',
-          resultFaces: nextShape ? countFaces(oc, nextShape) : null,
-          success: acceptedSplit(nextShape, beforeFaceCount),
-          toolFaces: tools.length
-        });
-
-        if (!acceptedSplit(nextShape, beforeFaceCount)) {
-          nextShape = null;
-        }
-      }
-
-      if (surfaceType === 'torus') {
-        diagnostics.torusSplits.push({
-          edgeTools: edges.length,
-          faceIndex,
-          faceKey,
-          methodResults,
-          phase: 'candidate-tried',
-          resultFaces: nextShape ? countFaces(oc, nextShape) : null,
-          success: acceptedSplit(nextShape, beforeFaceCount),
-          toolFaces: tools.length
-        });
-      }
-
-      if (acceptedSplit(nextShape, beforeFaceCount)) {
-        const successfulMethod = methodResults.find((result) => result.success)?.method || null;
-
-        if (surfaceType === 'cone') {
-          const boundaryCheck = validateConeSplitBoundaries(oc, nextShape, originalBoundaryEdges, edges);
-          const ok =
-            boundaryCheck.coneFaceBoundary.originalBoundary.ok &&
-            boundaryCheck.coneFaceBoundary.splitBoundary.ok &&
-            boundaryCheck.coneFaceBoundary.unexplainedBoundary.ok;
-
-          diagnostics.coneBoundaryChecks.push({
-            coneBoundaryTouchesApex,
-            edgeTools: edges.length,
-            faceIndex,
-            faceKey,
-            method: successfulMethod,
-            ok,
-            coneFaceBoundary: boundaryCheck.coneFaceBoundary,
-            wholeShapeBoundary: boundaryCheck.wholeShapeBoundary,
-            toolFaces: tools.length
-          });
-        }
-
-        diagnostics.successfulCandidates.push({
-          coneBoundaryTouchesApex: surfaceType === 'cone' ? coneBoundaryTouchesApex : undefined,
-          edgeTools: edges.length,
-          faceIndex,
-          faceKey,
-          method: successfulMethod,
-          resultFaces: countFaces(oc, nextShape),
-          surfaceType,
-          toolFaces: tools.length
-        });
-        currentShape = nextShape;
-        skippedFaces.clear();
-        appliedSplit = true;
-        diagnostics.successfulSplits += 1;
-        stats.successfulSplits += 1;
-        break;
-      }
-
-      skippedFaces.add(skipKey);
+        toolFaces: tools.length
+      });
+      diagnostics.successfulSplits += 1;
+      stats.successfulSplits += 1;
+    } else {
       failedSplitFaceKeys.add(faceKey);
       diagnostics.failedCandidates.push({
         coneBoundaryTouchesApex: surfaceType === 'cone' ? coneBoundaryTouchesApex : undefined,
@@ -1867,19 +1994,41 @@ function splitPrimitiveFacesBySurfaces(oc, shape, draftAngleDegrees) {
         faceIndex,
         faceKey,
         methodResults,
-        reason: 'Face-local OCCT edge split did not increase face count',
+        reason: 'Face-local OCCT split did not produce replacement faces',
         surfaceTools: tools.length,
         surfaceType
       });
       stats.failedCandidates += 1;
     }
 
-    if (!appliedSplit) {
-      break;
-    }
+    faceIndex += 1;
   }
 
-  return { diagnostics, shape: currentShape, failedSplitFaceKeys };
+  if (replacements.length === 0) {
+    return { diagnostics, failedSplitFaceKeys, shape };
+  }
+
+  try {
+    const reshaper = makeInstance(oc, 'BRepTools_ReShape');
+
+    for (const { face, replacement } of replacements) {
+      callAny(reshaper, ['Replace'], [face, replacement]);
+    }
+
+    const result = callAny(reshaper, ['Apply'], [shape, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_FACE')]);
+    return {
+      diagnostics,
+      failedSplitFaceKeys,
+      shape: callAny(result, ['IsNull']) ? shape : result
+    };
+  } catch (error) {
+    diagnostics.failedCandidates.push({
+      reason: `Batch face replacement failed: ${error.message || String(error)}`,
+      replacements: replacements.length
+    });
+
+    return { diagnostics, failedSplitFaceKeys, shape };
+  }
 }
 
 function pointToArray(point) {
@@ -2153,7 +2302,7 @@ export async function loadStepWithOpenCascade(buffer, draftAngleDegrees) {
   const oc = await getOpenCascade();
   let shape = readStepShape(oc, buffer);
 
-  const splitResult = splitPrimitiveFacesBySurfaces(oc, shape, draftAngleDegrees);
+  const splitResult = splitPrimitiveFacesBySurfacesBatch(oc, shape, draftAngleDegrees);
   shape = splitResult.shape;
   const splitStepText = writeStepShape(oc, shape);
   cleanTriangulation(oc, shape);

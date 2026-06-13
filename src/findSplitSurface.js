@@ -161,6 +161,8 @@ export function findTorusSplitSurfaces(torus, draftAngleDegrees) {
   const normalDirection = torus.normalDirection ?? 1;
   const frame = orthonormalFrame(torus.axis, torus.xDirection);
 
+  console.log('Torus split frame:', frame);
+
   if (!frame || Math.abs(threshold) >= 1) {
     return [];
   }
