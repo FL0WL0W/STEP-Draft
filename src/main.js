@@ -359,10 +359,12 @@ function addMeshToScene(mesh, failedFaceIndices, mixedFaceIndices, faceIndexOffs
     color: 0x101318,
     transparent: true,
     opacity: 0.82,
-    depthTest: true
+    depthTest: false,
+    depthWrite: false
   });
   const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial);
   edges.name = `${solid.name} boundaries`;
+  edges.renderOrder = 10;
   modelRoot.add(edges);
   return {
     boundarySegments: edgeGeometry.getAttribute('position').count / 2,
