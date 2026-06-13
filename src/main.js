@@ -1,13 +1,19 @@
 import './styles.css';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { loadStepWithOpenCascade } from './occtPipeline.js';
+import {
+  loadStepPreviewWithOpenCascade,
+  loadStepWithOpenCascade,
+  preloadStepWorkers,
+  terminatePreloadedStepWorkers
+} from './occtPipeline.js';
 
 const STORAGE_KEY = 'step-draft:last-step-file';
 
 const canvas = document.querySelector('#viewer');
 const uploadInput = document.querySelector('#step-upload');
 const draftAngleInput = document.querySelector('#draft-angle');
+const applyCutsButton = document.querySelector('#apply-cuts');
 const downloadSplitStepButton = document.querySelector('#download-split-step');
 const clearButton = document.querySelector('#clear-model');
 const statusEl = document.querySelector('#status');
@@ -55,19 +61,21 @@ scene.add(fillLight);
 
 let currentModel = null;
 let draftAnalysisVersion = 0;
+let isApplyingCuts = false;
 
 function setStatus(message) {
   statusEl.textContent = message;
 }
 
-function updateDownloadButton() {
+function updateButtons() {
+  applyCutsButton.disabled = !currentModel?.buffer || isApplyingCuts;
   downloadSplitStepButton.disabled = !currentModel?.splitStepText;
 }
 
 function clearModel() {
   modelRoot.clear();
   emptyState.classList.remove('is-hidden');
-  updateDownloadButton();
+  updateButtons();
 }
 
 function resizeRenderer() {
@@ -324,7 +332,8 @@ function addMeshToScene(mesh, failedFaceIndices, mixedFaceIndices, faceIndexOffs
   solid.name = mesh.name || 'STEP body';
   modelRoot.add(solid);
 
-  const failedTriangleGeometry = makeFailedTriangleGeometry(geometry, getDraftAngle());
+  const useFaceDraftClassification = Boolean(mesh.faceDraftClassification);
+  const failedTriangleGeometry = useFaceDraftClassification ? null : makeFailedTriangleGeometry(geometry, getDraftAngle());
   const failedTriangleCount = failedTriangleGeometry ? failedTriangleGeometry.getAttribute('position').count / 3 : 0;
 
   if (failedTriangleGeometry) {
@@ -430,9 +439,7 @@ function renderLoadedModel({ frame = true } = {}) {
     console.info('OCCT split diagnostics', currentModel.splitDiagnostics);
   }
 
-  setStatus(
-    `Loaded ${currentModel.fileName} - ${stats.failedTriangles} failed diagnostic triangles, ${stats.totalFaces} OCCT faces, ${stats.boundarySegments} BRep boundary segments${splitSummary}`
-  );
+  updateButtons();
 }
 
 function summarizeSplitDiagnostics(diagnostics) {
@@ -447,76 +454,104 @@ function summarizeSplitDiagnostics(diagnostics) {
   return parts.length > 0 ? `; splits - ${parts.join('; ')}` : '';
 }
 
-function progressLabel(progress, fileName) {
+function progressLabel(progress) {
   if (!progress?.totalFaces) {
-    return `Splitting ${fileName} with OCCT workers...`;
+    return 'Cut 0/0 faces';
   }
 
-  const last = progress.lastSurfaceType ? `; last ${progress.lastSurfaceType} face ${progress.lastFaceIndex}` : '';
-  return `Splitting ${fileName} with ${progress.workers} OCCT workers - ${progress.completedFaces}/${progress.totalFaces} faces, ${progress.replacementFaces} replacements${last}`;
+  return `Cut ${progress.completedFaces}/${progress.totalFaces} faces`;
 }
 
-async function updateDraftAnalysis() {
+function resetToBasePreview(statusMessage = null) {
+  if (!currentModel?.baseMeshes) {
+    return;
+  }
+
+  draftAnalysisVersion += 1;
+  isApplyingCuts = false;
+  currentModel.meshes = currentModel.baseMeshes;
+  currentModel.failedFaceIndices = new Set();
+  currentModel.mixedFaceIndices = new Set();
+  currentModel.splitStepText = null;
+  currentModel.splitDiagnostics = null;
+  currentModel.analyzedFaceCount = currentModel.baseTotalFaces || 0;
+  renderLoadedModel({ frame: false });
+
+  if (statusMessage) {
+    setStatus(statusMessage);
+  }
+}
+
+async function applyCuts() {
   if (!currentModel?.buffer) {
     return;
   }
 
   const version = (draftAnalysisVersion += 1);
   const draftAngle = getDraftAngle();
-  setStatus(`Evaluating analytic OCCT surfaces at ${draftAngle} degrees...`);
+  isApplyingCuts = true;
+  updateButtons();
+  setStatus('Cut 0/0 faces');
 
-  const draftAnalysis = await loadStepWithOpenCascade(currentModel.buffer, draftAngle, {
-    onInitialModel: (initialModel) => {
-      if (version !== draftAnalysisVersion) {
-        return;
-      }
+  try {
+    const draftAnalysis = await loadStepWithOpenCascade(currentModel.buffer, draftAngle, {
+      onInitialModel: (initialModel) => {
+        if (version !== draftAnalysisVersion) {
+          return;
+        }
 
-      currentModel.failedFaceIndices = initialModel.failedFaceIndices;
-      currentModel.mixedFaceIndices = initialModel.mixedFaceIndices;
-      currentModel.meshes = initialModel.meshes;
-      currentModel.splitDiagnostics = initialModel.splitDiagnostics;
-      currentModel.analyzedFaceCount = initialModel.totalFaces;
-      renderLoadedModel();
-    },
-    onPartialModel: (partialModel) => {
-      if (version !== draftAnalysisVersion) {
-        return;
-      }
+        currentModel.baseMeshes = initialModel.meshes;
+        currentModel.baseTotalFaces = initialModel.totalFaces;
+      },
+      onPartialModel: (partialModel) => {
+        if (version !== draftAnalysisVersion) {
+          return;
+        }
 
-      currentModel.failedFaceIndices = partialModel.failedFaceIndices;
-      currentModel.mixedFaceIndices = partialModel.mixedFaceIndices;
-      currentModel.meshes = partialModel.meshes;
-      currentModel.splitDiagnostics = partialModel.splitDiagnostics;
-      currentModel.analyzedFaceCount = partialModel.totalFaces;
-      renderLoadedModel({ frame: false });
-    },
-    onProgress: (progress) => {
-      if (version === draftAnalysisVersion) {
-        setStatus(progressLabel(progress, currentModel.fileName));
+        currentModel.failedFaceIndices = partialModel.failedFaceIndices;
+        currentModel.mixedFaceIndices = partialModel.mixedFaceIndices;
+        currentModel.meshes = partialModel.meshes;
+        currentModel.splitDiagnostics = partialModel.splitDiagnostics;
+        currentModel.analyzedFaceCount = partialModel.totalFaces;
+        renderLoadedModel({ frame: false });
+      },
+      onProgress: (progress) => {
+        if (version === draftAnalysisVersion) {
+          setStatus(progressLabel(progress));
+        }
       }
+    });
+
+    if (version !== draftAnalysisVersion) {
+      return;
     }
-  });
 
-  if (version !== draftAnalysisVersion) {
-    return;
+    currentModel.failedFaceIndices = draftAnalysis.failedFaceIndices;
+    currentModel.mixedFaceIndices = draftAnalysis.mixedFaceIndices;
+    currentModel.meshes = draftAnalysis.meshes;
+    currentModel.splitDiagnostics = draftAnalysis.splitDiagnostics;
+    currentModel.splitStepText = draftAnalysis.splitStepText;
+    currentModel.analyzedFaceCount = draftAnalysis.totalFaces;
+    renderLoadedModel();
+    setStatus('Face Cutting Complete');
+  } finally {
+    if (version === draftAnalysisVersion) {
+      isApplyingCuts = false;
+      updateButtons();
+    }
   }
-
-  currentModel.failedFaceIndices = draftAnalysis.failedFaceIndices;
-  currentModel.mixedFaceIndices = draftAnalysis.mixedFaceIndices;
-  currentModel.meshes = draftAnalysis.meshes;
-  currentModel.splitDiagnostics = draftAnalysis.splitDiagnostics;
-  currentModel.splitStepText = draftAnalysis.splitStepText;
-  currentModel.analyzedFaceCount = draftAnalysis.totalFaces;
-  renderLoadedModel();
 }
 
 async function loadStepBuffer(buffer, fileName) {
   clearModel();
-  setStatus(`Loading ${fileName} with OpenCascade...`);
+  await terminatePreloadedStepWorkers();
+  setStatus('Loading STEP');
 
   currentModel = {
     fileName,
     buffer,
+    baseMeshes: [],
+    baseTotalFaces: 0,
     meshes: [],
     failedFaceIndices: new Set(),
     mixedFaceIndices: new Set(),
@@ -525,40 +560,26 @@ async function loadStepBuffer(buffer, fileName) {
     analyzedFaceCount: 0
   };
 
-  const result = await loadStepWithOpenCascade(buffer, getDraftAngle(), {
-    onInitialModel: (initialModel) => {
-      currentModel.meshes = initialModel.meshes;
-      currentModel.failedFaceIndices = initialModel.failedFaceIndices;
-      currentModel.mixedFaceIndices = initialModel.mixedFaceIndices;
-      currentModel.splitDiagnostics = initialModel.splitDiagnostics;
-      currentModel.analyzedFaceCount = initialModel.totalFaces;
-      renderLoadedModel();
-    },
-    onPartialModel: (partialModel) => {
-      currentModel.meshes = partialModel.meshes;
-      currentModel.failedFaceIndices = partialModel.failedFaceIndices;
-      currentModel.mixedFaceIndices = partialModel.mixedFaceIndices;
-      currentModel.splitDiagnostics = partialModel.splitDiagnostics;
-      currentModel.analyzedFaceCount = partialModel.totalFaces;
-      renderLoadedModel({ frame: false });
-    },
-    onProgress: (progress) => {
-      setStatus(progressLabel(progress, fileName));
-    }
-  });
+  const result = await loadStepPreviewWithOpenCascade(buffer);
   const meshes = result.meshes || [];
 
   currentModel = {
     fileName,
     buffer,
+    baseMeshes: meshes,
+    baseTotalFaces: result.totalFaces,
     meshes,
-    failedFaceIndices: result.failedFaceIndices,
-    mixedFaceIndices: result.mixedFaceIndices,
-    splitStepText: result.splitStepText,
-    splitDiagnostics: result.splitDiagnostics,
+    failedFaceIndices: new Set(),
+    mixedFaceIndices: new Set(),
+    splitStepText: null,
+    splitDiagnostics: null,
     analyzedFaceCount: result.totalFaces
   };
   renderLoadedModel();
+  setStatus('Step Loaded');
+  preloadStepWorkers(buffer).catch((error) => {
+    console.warn('Could not preload OCCT workers.', error);
+  });
 }
 
 uploadInput.addEventListener('change', async (event) => {
@@ -582,6 +603,11 @@ uploadInput.addEventListener('change', async (event) => {
 
 clearButton.addEventListener('click', () => {
   localStorage.removeItem(STORAGE_KEY);
+  terminatePreloadedStepWorkers().catch((error) => {
+    console.warn('Could not terminate OCCT workers.', error);
+  });
+  draftAnalysisVersion += 1;
+  isApplyingCuts = false;
   currentModel = null;
   clearModel();
   setStatus('Cleared saved STEP file');
@@ -595,11 +621,17 @@ downloadSplitStepButton.addEventListener('click', () => {
   downloadTextFile(splitStepFileName(currentModel.fileName), currentModel.splitStepText);
 });
 
-draftAngleInput.addEventListener('input', () => {
-  updateDraftAnalysis().catch((error) => {
+applyCutsButton.addEventListener('click', () => {
+  applyCuts().catch((error) => {
     console.error(error);
+    isApplyingCuts = false;
+    updateButtons();
     setStatus(error.message);
   });
+});
+
+draftAngleInput.addEventListener('input', () => {
+  resetToBasePreview();
 });
 
 const savedFile = getSavedStepFile();

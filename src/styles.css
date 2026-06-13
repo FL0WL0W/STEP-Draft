@@ -67,6 +67,7 @@ input {
 }
 
 .upload-button,
+.apply-button,
 .ghost-button {
   display: inline-flex;
   align-items: center;
@@ -110,8 +111,15 @@ input {
   font-weight: 650;
 }
 
-.upload-button:hover {
+.upload-button:hover,
+.apply-button:hover {
   background: var(--accent-hover);
+}
+
+.apply-button {
+  background: #4f8a44;
+  color: white;
+  font-weight: 650;
 }
 
 .upload-button input {
@@ -128,9 +136,14 @@ input {
   border-color: #68717c;
 }
 
+.apply-button:disabled,
 .ghost-button:disabled {
   cursor: not-allowed;
   opacity: 0.48;
+}
+
+.apply-button:disabled:hover {
+  background: #4f8a44;
 }
 
 .ghost-button:disabled:hover {

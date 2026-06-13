@@ -1515,6 +1515,72 @@ function normalFromDerivatives(oc, surface, u, v, forward) {
   return { nx, ny, nz };
 }
 
+function normalFailsDraftRule(nz, draftAngleDegrees) {
+  if (nz < 0) {
+    return true;
+  }
+
+  const draftFromVertical = (Math.asin(Math.min(Math.max(Math.abs(nz), 0), 1)) * 180) / Math.PI;
+  return draftFromVertical < draftAngleDegrees;
+}
+
+function faceFailsDraftRule(oc, face, draftAngleDegrees) {
+  let surface;
+
+  try {
+    surface = makeInstance(oc, 'BRepAdaptor_Surface', [face, true]);
+  } catch {
+    return false;
+  }
+
+  const uFirst = callAny(surface, ['FirstUParameter']);
+  const uLast = callAny(surface, ['LastUParameter']);
+  const vFirst = callAny(surface, ['FirstVParameter']);
+  const vLast = callAny(surface, ['LastVParameter']);
+
+  if (![uFirst, uLast, vFirst, vLast].every(Number.isFinite) || uLast <= uFirst || vLast <= vFirst) {
+    return false;
+  }
+
+  const forward = shapeOrientation(face) !== enumValue(oc, 'TopAbs_Orientation', 'TopAbs_REVERSED');
+  const uvSamples = [
+    [0.5, 0.5],
+    [0.25, 0.25],
+    [0.25, 0.5],
+    [0.25, 0.75],
+    [0.5, 0.25],
+    [0.5, 0.75],
+    [0.75, 0.25],
+    [0.75, 0.5],
+    [0.75, 0.75]
+  ];
+  let failingSamples = 0;
+  let passingSamples = 0;
+
+  for (const [uRatio, vRatio] of uvSamples) {
+    const u = uFirst + (uLast - uFirst) * uRatio;
+    const v = vFirst + (vLast - vFirst) * vRatio;
+
+    try {
+      const normal = normalFromDerivatives(oc, surface, u, v, forward);
+
+      if (normalFailsDraftRule(normal.nz, draftAngleDegrees)) {
+        failingSamples += 1;
+      } else {
+        passingSamples += 1;
+      }
+    } catch {
+      // Keep going; trimmed or singular regions can reject some sample points.
+    }
+  }
+
+  if (failingSamples === 0 && passingSamples === 0) {
+    return false;
+  }
+
+  return failingSamples >= passingSamples;
+}
+
 function safeBuildEdgeCurves(oc, edge, face) {
   tryCallAnyArgs(oc.BRepLib, ['BuildCurve3d'], [[edge, 1e-7, enumValue(oc, 'GeomAbs_Shape', 'GeomAbs_C1'), 14, 16]]);
   tryCallAnyArgs(oc.BRepLib, ['SameParameter_1', 'SameParameter'], [[edge, 1e-7]]);
@@ -3046,6 +3112,98 @@ function workerCountForJobs(jobCount, requestedCount) {
 }
 
 const WORKER_RENDER_INTERVAL_MS = 250;
+let preloadedWorkerPool = null;
+
+function terminateWorkerPool(pool) {
+  for (const entry of pool?.workers || []) {
+    entry.worker.terminate();
+  }
+}
+
+export async function terminatePreloadedStepWorkers() {
+  if (preloadedWorkerPool) {
+    terminateWorkerPool(preloadedWorkerPool);
+    preloadedWorkerPool = null;
+  }
+}
+
+export async function preloadStepWorkers(buffer, options = {}) {
+  if (typeof Worker === 'undefined') {
+    return { workers: 0 };
+  }
+
+  if (preloadedWorkerPool?.buffer === buffer) {
+    await preloadedWorkerPool.readyPromise;
+    return { workers: preloadedWorkerPool.workers.length };
+  }
+
+  await terminatePreloadedStepWorkers();
+
+  const oc = await getOpenCascade();
+  const shape = readStepShape(oc, buffer);
+  const jobs = collectFaceJobs(oc, shape);
+  const workerCount = workerCountForJobs(jobs.length, options.workerCount);
+
+  if (workerCount === 0) {
+    return { workers: 0 };
+  }
+
+  const pool = {
+    buffer,
+    busy: false,
+    workers: []
+  };
+
+  pool.readyPromise = Promise.all(Array.from({ length: workerCount }, () => new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./occtWorker.js', import.meta.url));
+    const entry = { worker };
+    pool.workers.push(entry);
+
+    function cleanup() {
+      worker.removeEventListener('message', handleMessage);
+      worker.removeEventListener('error', handleError);
+    }
+
+    function handleMessage(event) {
+      const message = event.data || {};
+
+      if (message.type === 'ready') {
+        cleanup();
+        resolve(entry);
+      } else if (message.type === 'error') {
+        cleanup();
+        reject(new Error(message.error || 'OCCT worker failed during preload.'));
+      }
+    }
+
+    function handleError(error) {
+      cleanup();
+      reject(error.error || new Error(error.message || 'OCCT worker failed during preload.'));
+    }
+
+    worker.addEventListener('message', handleMessage);
+    worker.addEventListener('error', handleError);
+    worker.postMessage({
+      buffer,
+      type: 'init'
+    });
+  })));
+
+  preloadedWorkerPool = pool;
+
+  try {
+    await pool.readyPromise;
+  } catch (error) {
+    if (preloadedWorkerPool === pool) {
+      preloadedWorkerPool = null;
+    }
+
+    terminateWorkerPool(pool);
+    throw error;
+  }
+
+  return { workers: workerCount };
+}
 
 async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegrees, options = {}) {
   const jobs = collectFaceJobs(oc, shape);
@@ -3053,6 +3211,21 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
 
   if (workerCount === 0) {
     return splitPrimitiveFacesBySurfacesBatch(oc, shape, draftAngleDegrees);
+  }
+
+  let borrowedPool = null;
+  let borrowedWorkers = null;
+
+  if (preloadedWorkerPool?.buffer === buffer && !preloadedWorkerPool.busy) {
+    try {
+      await preloadedWorkerPool.readyPromise;
+      borrowedPool = preloadedWorkerPool;
+      borrowedWorkers = borrowedPool.workers.map((entry) => entry.worker);
+      borrowedPool.busy = true;
+    } catch {
+      borrowedPool = null;
+      borrowedWorkers = null;
+    }
   }
 
   const diagnostics = createSplitDiagnostics();
@@ -3065,7 +3238,8 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
   let settled = false;
 
   return new Promise((resolve, reject) => {
-    const workers = [];
+    const workers = borrowedWorkers || [];
+    const workerHandlers = [];
     const renderTimer = setInterval(() => {
       try {
         if (settled || replacements.size === streamedReplacementCount) {
@@ -3094,8 +3268,17 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
     function cleanup() {
       clearInterval(renderTimer);
 
-      for (const worker of workers) {
-        worker.terminate();
+      for (const { handleError, handleMessage, worker } of workerHandlers) {
+        worker.removeEventListener('message', handleMessage);
+        worker.removeEventListener('error', handleError);
+      }
+
+      if (borrowedPool) {
+        borrowedPool.busy = false;
+      } else {
+        for (const worker of workers) {
+          worker.terminate();
+        }
       }
     }
 
@@ -3175,11 +3358,8 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
       finishIfDone();
     }
 
-    for (let index = 0; index < workerCount; index += 1) {
-      const worker = new Worker(new URL('./occtWorker.js', import.meta.url));
-      workers.push(worker);
-
-      worker.addEventListener('message', (event) => {
+    function attachWorker(worker, initialize) {
+      function handleMessage(event) {
         const message = event.data || {};
 
         if (settled) {
@@ -3207,9 +3387,9 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
           cleanup();
           reject(new Error(message.error || 'OCCT worker failed.'));
         }
-      });
+      }
 
-      worker.addEventListener('error', (error) => {
+      function handleError(error) {
         if (settled) {
           return;
         }
@@ -3217,13 +3397,32 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
         settled = true;
         cleanup();
         reject(error.error || new Error(error.message || 'OCCT worker failed.'));
-      });
+      }
 
-      worker.postMessage({
-        buffer,
-        draftAngleDegrees,
-        type: 'init'
-      });
+      worker.addEventListener('message', handleMessage);
+      worker.addEventListener('error', handleError);
+      workerHandlers.push({ handleError, handleMessage, worker });
+
+      if (initialize) {
+        worker.postMessage({
+          buffer,
+          type: 'init'
+        });
+      } else {
+        assignJob(worker);
+      }
+    }
+
+    if (borrowedWorkers) {
+      for (const worker of borrowedWorkers) {
+        attachWorker(worker, false);
+      }
+    } else {
+      for (let index = 0; index < workerCount; index += 1) {
+        const worker = new Worker(new URL('./occtWorker.js', import.meta.url));
+        workers.push(worker);
+        attachWorker(worker, true);
+      }
     }
   });
 }
@@ -3523,7 +3722,7 @@ function collectBoundaryLines(oc, shape) {
   return positions;
 }
 
-function buildRenderModelFromShape(oc, shape, splitResult, splitStepText = null) {
+function buildRenderModelFromShape(oc, shape, splitResult, splitStepText = null, options = {}) {
   cleanTriangulation(oc, shape);
   triangulateShape(oc, shape);
 
@@ -3547,6 +3746,10 @@ function buildRenderModelFromShape(oc, shape, splitResult, splitStepText = null)
 
     if (range) {
       output.brep_faces.push({ ...range, faceIndex });
+
+      if (options.classifyDraftFaces && faceFailsDraftRule(oc, face, options.draftAngleDegrees ?? 3)) {
+        output.failedFaceIndices.add(faceIndex);
+      }
     }
 
     faceIndex += 1;
@@ -3579,7 +3782,8 @@ function buildRenderModelFromShape(oc, shape, splitResult, splitStepText = null)
           array: output.indices
         },
         brep_faces: output.brep_faces,
-        edgePositions: output.edgePositions
+        edgePositions: output.edgePositions,
+        faceDraftClassification: Boolean(options.classifyDraftFaces)
       }
     ],
     failedFaceIndices: output.failedFaceIndices,
@@ -3609,6 +3813,9 @@ export async function loadStepWithOpenCascade(buffer, draftAngleDegrees, options
           if (progress.currentShape && options.onPartialModel) {
             options.onPartialModel(buildRenderModelFromShape(oc, progress.currentShape, {
               diagnostics: createSplitDiagnostics()
+            }, null, {
+              classifyDraftFaces: true,
+              draftAngleDegrees
             }));
           }
         }
@@ -3623,5 +3830,17 @@ export async function loadStepWithOpenCascade(buffer, draftAngleDegrees, options
 
   shape = splitResult.shape;
   const splitStepText = writeStepShape(oc, shape);
-  return buildRenderModelFromShape(oc, shape, splitResult, splitStepText);
+  return buildRenderModelFromShape(oc, shape, splitResult, splitStepText, {
+    classifyDraftFaces: true,
+    draftAngleDegrees
+  });
+}
+
+export async function loadStepPreviewWithOpenCascade(buffer) {
+  const oc = await getOpenCascade();
+  const shape = readStepShape(oc, buffer);
+
+  return buildRenderModelFromShape(oc, shape, {
+    diagnostics: createSplitDiagnostics()
+  });
 }
