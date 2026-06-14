@@ -43,6 +43,7 @@ import {
   collectFaces,
   faceAtIndex
 } from './faceJobs.js';
+import { rotateShape } from './shapeTransform.js';
 
 export { getOpenCascade };
 
@@ -1649,6 +1650,18 @@ function workerCountForJobs(jobCount, requestedCount) {
 const WORKER_RENDER_INTERVAL_MS = 250;
 let preloadedWorkerPool = null;
 
+function rotationKey(rotation = {}) {
+  return JSON.stringify({
+    x: Number(rotation.x) || 0,
+    y: Number(rotation.y) || 0,
+    z: Number(rotation.z) || 0
+  });
+}
+
+function readStepShapeWithRotation(oc, buffer, rotation = {}) {
+  return rotateShape(oc, readStepShape(oc, buffer), rotation);
+}
+
 function terminateWorkerPool(pool) {
   for (const entry of pool?.workers || []) {
     entry.worker.terminate();
@@ -1667,7 +1680,9 @@ export async function preloadStepWorkers(buffer, options = {}) {
     return { workers: 0 };
   }
 
-  if (preloadedWorkerPool?.buffer === buffer) {
+  const preloadRotationKey = rotationKey(options.rotation);
+
+  if (preloadedWorkerPool?.buffer === buffer && preloadedWorkerPool.rotationKey === preloadRotationKey) {
     await preloadedWorkerPool.readyPromise;
     return { workers: preloadedWorkerPool.workers.length };
   }
@@ -1675,7 +1690,7 @@ export async function preloadStepWorkers(buffer, options = {}) {
   await terminatePreloadedStepWorkers();
 
   const oc = await getOpenCascade();
-  const shape = readStepShape(oc, buffer);
+  const shape = readStepShapeWithRotation(oc, buffer, options.rotation);
   const jobs = collectFaceJobs(oc, shape);
   const workerCount = workerCountForJobs(jobs.length, options.workerCount);
 
@@ -1686,6 +1701,7 @@ export async function preloadStepWorkers(buffer, options = {}) {
   const pool = {
     buffer,
     busy: false,
+    rotationKey: preloadRotationKey,
     workers: []
   };
 
@@ -1720,6 +1736,7 @@ export async function preloadStepWorkers(buffer, options = {}) {
     worker.addEventListener('error', handleError);
     worker.postMessage({
       buffer,
+      rotation: options.rotation,
       type: 'init'
     });
   })));
@@ -1751,7 +1768,13 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
   let borrowedPool = null;
   let borrowedWorkers = null;
 
-  if (preloadedWorkerPool?.buffer === buffer && !preloadedWorkerPool.busy) {
+  const splitRotationKey = rotationKey(options.rotation);
+
+  if (
+    preloadedWorkerPool?.buffer === buffer &&
+    preloadedWorkerPool.rotationKey === splitRotationKey &&
+    !preloadedWorkerPool.busy
+  ) {
     try {
       await preloadedWorkerPool.readyPromise;
       borrowedPool = preloadedWorkerPool;
@@ -1781,7 +1804,7 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
           return;
         }
 
-        const snapshotShape = readStepShape(oc, buffer);
+        const snapshotShape = readStepShapeWithRotation(oc, buffer, options.rotation);
         const snapshotFaces = collectFaces(oc, snapshotShape);
         const currentShape = applyReplacementMap(oc, snapshotShape, snapshotFaces, replacements);
 
@@ -1825,7 +1848,7 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
       settled = true;
       cleanup();
 
-      const finalBaseShape = readStepShape(oc, buffer);
+      const finalBaseShape = readStepShapeWithRotation(oc, buffer, options.rotation);
       const finalFaces = collectFaces(oc, finalBaseShape);
       const finalShape = applyReplacementMap(oc, finalBaseShape, finalFaces, replacements);
       options.onProgress?.({
@@ -1941,6 +1964,7 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
       if (initialize) {
         worker.postMessage({
           buffer,
+          rotation: options.rotation,
           type: 'init'
         });
       } else {
@@ -1962,9 +1986,9 @@ async function splitPrimitiveFacesWithWorkers(oc, shape, buffer, draftAngleDegre
   });
 }
 
-export async function createStepFaceProcessor(buffer) {
+export async function createStepFaceProcessor(buffer, options = {}) {
   const oc = await getOpenCascade();
-  const shape = readStepShape(oc, buffer);
+  const shape = readStepShapeWithRotation(oc, buffer, options.rotation);
 
   return {
     processFace(faceIndex, draftAngleDegrees) {
@@ -2010,7 +2034,7 @@ function buildRenderModelFromShape(oc, shape, splitResult, splitStepText = null,
 
 export async function loadStepWithOpenCascade(buffer, draftAngleDegrees, options = {}) {
   const oc = await getOpenCascade();
-  let shape = readStepShape(oc, buffer);
+  let shape = readStepShapeWithRotation(oc, buffer, options.rotation);
   options.onInitialModel?.(buildRenderModelFromShape(oc, shape, {
     diagnostics: createSplitDiagnostics()
   }));
@@ -2050,9 +2074,9 @@ export async function loadStepWithOpenCascade(buffer, draftAngleDegrees, options
   });
 }
 
-export async function loadStepPreviewWithOpenCascade(buffer) {
+export async function loadStepPreviewWithOpenCascade(buffer, options = {}) {
   const oc = await getOpenCascade();
-  const shape = readStepShape(oc, buffer);
+  const shape = readStepShapeWithRotation(oc, buffer, options.rotation);
 
   return buildRenderModelFromShape(oc, shape, {
     diagnostics: createSplitDiagnostics()

@@ -13,6 +13,13 @@ const STORAGE_KEY = 'step-draft:last-step-file';
 const canvas = document.querySelector('#viewer');
 const uploadInput = document.querySelector('#step-upload');
 const draftAngleInput = document.querySelector('#draft-angle');
+const rotationInputs = {
+  x: document.querySelector('#rotation-x'),
+  y: document.querySelector('#rotation-y'),
+  z: document.querySelector('#rotation-z')
+};
+const rotationStepButtons = Array.from(document.querySelectorAll('.rotation-step'));
+const rotationResetButton = document.querySelector('#rotation-reset');
 const applyCutsButton = document.querySelector('#apply-cuts');
 const downloadSplitStepButton = document.querySelector('#download-split-step');
 const clearButton = document.querySelector('#clear-model');
@@ -62,6 +69,7 @@ scene.add(fillLight);
 let currentModel = null;
 let draftAnalysisVersion = 0;
 let isApplyingCuts = false;
+const DEFAULT_ROTATION = { x: 0, y: 0, z: 0 };
 
 function setStatus(message) {
   statusEl.textContent = message;
@@ -70,10 +78,23 @@ function setStatus(message) {
 function updateButtons() {
   applyCutsButton.disabled = !currentModel?.buffer || isApplyingCuts;
   downloadSplitStepButton.disabled = !currentModel?.splitStepText;
+  const hasModel = Boolean(currentModel?.buffer);
+
+  for (const input of Object.values(rotationInputs)) {
+    input.disabled = !hasModel;
+  }
+
+  for (const button of rotationStepButtons) {
+    button.disabled = !hasModel;
+  }
+
+  rotationResetButton.disabled = !hasModel;
 }
 
 function clearModel() {
   modelRoot.clear();
+  modelRoot.position.set(0, 0, 0);
+  modelRoot.rotation.set(0, 0, 0);
   emptyState.classList.remove('is-hidden');
   updateButtons();
 }
@@ -120,14 +141,31 @@ function base64ToArrayBuffer(base64) {
   return bytes.buffer;
 }
 
-function saveStepFile(fileName, buffer) {
+function normalizedRotation(rotation = DEFAULT_ROTATION) {
+  return {
+    x: normalizeDegrees(rotation.x),
+    y: normalizeDegrees(rotation.y),
+    z: normalizeDegrees(rotation.z)
+  };
+}
+
+function saveStepFile(fileName, buffer, rotation = DEFAULT_ROTATION) {
   const payload = {
     fileName,
     savedAt: new Date().toISOString(),
-    data: arrayBufferToBase64(buffer)
+    data: arrayBufferToBase64(buffer),
+    rotation: normalizedRotation(rotation)
   };
 
   localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+}
+
+function saveCurrentRotation() {
+  if (!currentModel?.buffer) {
+    return;
+  }
+
+  saveStepFile(currentModel.fileName, currentModel.buffer, currentModel.rotation);
 }
 
 function getSavedStepFile() {
@@ -141,7 +179,8 @@ function getSavedStepFile() {
     const payload = JSON.parse(raw);
     return {
       fileName: payload.fileName || 'saved-model.step',
-      buffer: base64ToArrayBuffer(payload.data)
+      buffer: base64ToArrayBuffer(payload.data),
+      rotation: normalizedRotation(payload.rotation)
     };
   } catch (error) {
     localStorage.removeItem(STORAGE_KEY);
@@ -190,6 +229,56 @@ function getDraftAngle() {
   }
 
   return Math.min(Math.max(value, 0), 89);
+}
+
+function normalizeDegrees(value) {
+  const parsed = Number.parseFloat(value);
+
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+
+  let normalized = parsed % 360;
+
+  if (normalized <= -180) {
+    normalized += 360;
+  }
+
+  if (normalized > 180) {
+    normalized -= 360;
+  }
+
+  return Number(normalized.toFixed(6));
+}
+
+function updateRotationInputs() {
+  const rotation = normalizedRotation(currentModel?.rotation);
+
+  for (const axis of ['x', 'y', 'z']) {
+    rotationInputs[axis].value = String(rotation[axis]);
+  }
+}
+
+function applyModelRotation() {
+  modelRoot.rotation.set(0, 0, 0);
+}
+
+function setModelRotation(nextRotation, { save = true } = {}) {
+  if (!currentModel) {
+    return;
+  }
+
+  currentModel.rotation = normalizedRotation(nextRotation);
+  updateRotationInputs();
+
+  if (save) {
+    saveCurrentRotation();
+  }
+
+  refreshBasePreviewForRotation().catch((error) => {
+    console.error(error);
+    setStatus(error.message);
+  });
 }
 
 function failsNormalRule(nz, draftAngleDegrees) {
@@ -384,6 +473,25 @@ function addMeshToScene(mesh, failedFaceIndices, mixedFaceIndices, faceIndexOffs
   };
 }
 
+function centerModelPivot() {
+  modelRoot.position.set(0, 0, 0);
+  modelRoot.rotation.set(0, 0, 0);
+
+  const box = new THREE.Box3().setFromObject(modelRoot);
+
+  if (box.isEmpty()) {
+    return;
+  }
+
+  const center = box.getCenter(new THREE.Vector3());
+
+  for (const child of modelRoot.children) {
+    child.position.sub(center);
+  }
+
+  modelRoot.position.copy(center);
+}
+
 function frameModel() {
   const box = new THREE.Box3().setFromObject(modelRoot);
 
@@ -427,6 +535,9 @@ function renderLoadedModel({ frame = true } = {}) {
     },
     { boundarySegments: 0, failedTriangles: 0, failedFaces: 0, mixedFaces: 0, totalFaces: 0 }
   );
+
+  centerModelPivot();
+  applyModelRotation();
 
   if (frame) {
     frameModel();
@@ -495,6 +606,7 @@ async function applyCuts() {
 
   try {
     const draftAnalysis = await loadStepWithOpenCascade(currentModel.buffer, draftAngle, {
+      rotation: currentModel.rotation,
       onInitialModel: (initialModel) => {
         if (version !== draftAnalysisVersion) {
           return;
@@ -542,7 +654,7 @@ async function applyCuts() {
   }
 }
 
-async function loadStepBuffer(buffer, fileName) {
+async function loadStepBuffer(buffer, fileName, rotation = DEFAULT_ROTATION) {
   clearModel();
   await terminatePreloadedStepWorkers();
   setStatus('Loading STEP');
@@ -550,6 +662,7 @@ async function loadStepBuffer(buffer, fileName) {
   currentModel = {
     fileName,
     buffer,
+    rotation: normalizedRotation(rotation),
     baseMeshes: [],
     baseTotalFaces: 0,
     meshes: [],
@@ -560,12 +673,15 @@ async function loadStepBuffer(buffer, fileName) {
     analyzedFaceCount: 0
   };
 
-  const result = await loadStepPreviewWithOpenCascade(buffer);
+  const result = await loadStepPreviewWithOpenCascade(buffer, {
+    rotation: currentModel.rotation
+  });
   const meshes = result.meshes || [];
 
   currentModel = {
     fileName,
     buffer,
+    rotation: normalizedRotation(currentModel?.rotation || rotation),
     baseMeshes: meshes,
     baseTotalFaces: result.totalFaces,
     meshes,
@@ -575,9 +691,52 @@ async function loadStepBuffer(buffer, fileName) {
     splitDiagnostics: null,
     analyzedFaceCount: result.totalFaces
   };
+  updateRotationInputs();
   renderLoadedModel();
   setStatus('Step Loaded');
-  preloadStepWorkers(buffer).catch((error) => {
+  preloadStepWorkers(buffer, {
+    rotation: currentModel.rotation
+  }).catch((error) => {
+    console.warn('Could not preload OCCT workers.', error);
+  });
+}
+
+async function refreshBasePreviewForRotation() {
+  if (!currentModel?.buffer) {
+    return;
+  }
+
+  const version = (draftAnalysisVersion += 1);
+  const rotation = normalizedRotation(currentModel.rotation);
+
+  isApplyingCuts = false;
+  currentModel.splitStepText = null;
+  currentModel.splitDiagnostics = null;
+  currentModel.failedFaceIndices = new Set();
+  currentModel.mixedFaceIndices = new Set();
+  updateButtons();
+  setStatus('Loading STEP');
+  await terminatePreloadedStepWorkers();
+
+  const result = await loadStepPreviewWithOpenCascade(currentModel.buffer, {
+    rotation
+  });
+
+  if (version !== draftAnalysisVersion || !currentModel) {
+    return;
+  }
+
+  const meshes = result.meshes || [];
+  currentModel.rotation = rotation;
+  currentModel.baseMeshes = meshes;
+  currentModel.baseTotalFaces = result.totalFaces;
+  currentModel.meshes = meshes;
+  currentModel.analyzedFaceCount = result.totalFaces;
+  renderLoadedModel();
+  setStatus('Step Loaded');
+  preloadStepWorkers(currentModel.buffer, {
+    rotation
+  }).catch((error) => {
     console.warn('Could not preload OCCT workers.', error);
   });
 }
@@ -591,8 +750,9 @@ uploadInput.addEventListener('change', async (event) => {
 
   try {
     const buffer = await file.arrayBuffer();
-    saveStepFile(file.name, buffer);
-    await loadStepBuffer(buffer, file.name);
+    const rotation = { ...DEFAULT_ROTATION };
+    saveStepFile(file.name, buffer, rotation);
+    await loadStepBuffer(buffer, file.name, rotation);
   } catch (error) {
     console.error(error);
     setStatus(error.message);
@@ -609,6 +769,7 @@ clearButton.addEventListener('click', () => {
   draftAnalysisVersion += 1;
   isApplyingCuts = false;
   currentModel = null;
+  updateRotationInputs();
   clearModel();
   setStatus('Cleared saved STEP file');
 });
@@ -634,13 +795,44 @@ draftAngleInput.addEventListener('input', () => {
   resetToBasePreview();
 });
 
+for (const [axis, input] of Object.entries(rotationInputs)) {
+  input.addEventListener('change', () => {
+    setModelRotation({
+      ...currentModel?.rotation,
+      [axis]: input.value
+    });
+  });
+}
+
+for (const button of rotationStepButtons) {
+  button.addEventListener('click', () => {
+    const axis = button.dataset.axis;
+    const degrees = Number.parseFloat(button.dataset.degrees);
+
+    if (!axis || !Number.isFinite(degrees)) {
+      return;
+    }
+
+    setModelRotation({
+      ...currentModel?.rotation,
+      [axis]: (currentModel?.rotation?.[axis] || 0) + degrees
+    });
+  });
+}
+
+rotationResetButton.addEventListener('click', () => {
+  setModelRotation(DEFAULT_ROTATION);
+});
+
 const savedFile = getSavedStepFile();
 
 if (savedFile) {
-  loadStepBuffer(savedFile.buffer, savedFile.fileName).catch((error) => {
+  loadStepBuffer(savedFile.buffer, savedFile.fileName, savedFile.rotation).catch((error) => {
     console.error(error);
     setStatus(error.message);
   });
+} else {
+  updateRotationInputs();
 }
 
 animate();

@@ -7,7 +7,9 @@ self.addEventListener('message', async (event) => {
 
   try {
     if (message.type === 'init') {
-      processorPromise = createStepFaceProcessor(message.buffer);
+      processorPromise = createStepFaceProcessor(message.buffer, {
+        rotation: message.rotation
+      });
       await processorPromise;
       self.postMessage({ type: 'ready' });
       return;

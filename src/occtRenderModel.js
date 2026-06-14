@@ -182,6 +182,36 @@ function normalFailsDraftRule(nz, draftAngleDegrees) {
   return draftFromVertical < draftAngleDegrees;
 }
 
+function sampleFaceUvCentroids(oc, face, helpers) {
+  const data = triangulationForFace(oc, face, helpers);
+
+  if (!data?.triangulation || !helpers.callAny(data.triangulation, ['HasUVNodes'])) {
+    return [];
+  }
+
+  const { triangulation } = data;
+  const triangleCount = helpers.callAny(triangulation, ['NbTriangles']);
+  const maxSamples = 96;
+  const stride = Math.max(1, Math.floor(triangleCount / maxSamples));
+  const samples = [];
+
+  // Use OCCT triangulation only to choose points inside the trimmed face.
+  // Normals are still evaluated analytically from the underlying surface.
+  for (let triangleIndex = 1; triangleIndex <= triangleCount; triangleIndex += stride) {
+    const triangle = helpers.callAny(triangulation, ['Triangle'], [triangleIndex]);
+    const uvA = helpers.callAny(triangulation, ['UVNode'], [triangleVertexIndex(triangle, 1)]);
+    const uvB = helpers.callAny(triangulation, ['UVNode'], [triangleVertexIndex(triangle, 2)]);
+    const uvC = helpers.callAny(triangulation, ['UVNode'], [triangleVertexIndex(triangle, 3)]);
+
+    samples.push([
+      (helpers.callAny(uvA, ['X']) + helpers.callAny(uvB, ['X']) + helpers.callAny(uvC, ['X'])) / 3,
+      (helpers.callAny(uvA, ['Y']) + helpers.callAny(uvB, ['Y']) + helpers.callAny(uvC, ['Y'])) / 3
+    ]);
+  }
+
+  return samples;
+}
+
 function faceFailsDraftRule(oc, face, draftAngleDegrees, helpers) {
   let surface;
 
@@ -201,24 +231,16 @@ function faceFailsDraftRule(oc, face, draftAngleDegrees, helpers) {
   }
 
   const forward = helpers.shapeOrientation(face) !== helpers.enumValue(oc, 'TopAbs_Orientation', 'TopAbs_REVERSED');
-  const uvSamples = [
-    [0.5, 0.5],
-    [0.25, 0.25],
-    [0.25, 0.5],
-    [0.25, 0.75],
-    [0.5, 0.25],
-    [0.5, 0.75],
-    [0.75, 0.25],
-    [0.75, 0.5],
-    [0.75, 0.75]
-  ];
+  const uvSamples = sampleFaceUvCentroids(oc, face, helpers);
+
+  if (uvSamples.length === 0) {
+    return false;
+  }
+
   let failingSamples = 0;
   let passingSamples = 0;
 
-  for (const [uRatio, vRatio] of uvSamples) {
-    const u = uFirst + (uLast - uFirst) * uRatio;
-    const v = vFirst + (vLast - vFirst) * vRatio;
-
+  for (const [u, v] of uvSamples) {
     try {
       const normal = helpers.normalFromDerivatives(oc, surface, u, v, forward);
 
