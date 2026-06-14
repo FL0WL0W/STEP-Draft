@@ -727,6 +727,142 @@ function makeCompoundFromShapes(oc, shapes) {
   return compound;
 }
 
+function shellFromExplorer(oc, explorer) {
+  const shape = callAny(explorer, ['Current']);
+
+  if (oc.TopoDS?.Shell_1) {
+    return oc.TopoDS.Shell_1(shape);
+  }
+
+  if (oc.TopoDS?.Shell) {
+    return oc.TopoDS.Shell(shape);
+  }
+
+  return shape;
+}
+
+function fixShape(oc, shape) {
+  try {
+    const fixer = makeInstance(oc, 'ShapeFix_Shape', [shape]);
+    tryCallAnyArgs(fixer, ['SetPrecision'], [[1e-7]]);
+    tryCallAnyArgs(fixer, ['SetMinTolerance'], [[1e-7]]);
+    tryCallAnyArgs(fixer, ['SetMaxTolerance'], [[1e-4]]);
+    tryCallAnyArgs(fixer, ['Perform'], [[makeInstance(oc, 'Message_ProgressRange')], []]);
+    const fixed = callAny(fixer, ['Shape']);
+    return fixed && !callAny(fixed, ['IsNull']) ? fixed : shape;
+  } catch {
+    try {
+      const fixer = makeInstance(oc, 'ShapeFix_Shape');
+      callAny(fixer, ['Init'], [shape]);
+      tryCallAnyArgs(fixer, ['SetPrecision'], [[1e-7]]);
+      tryCallAnyArgs(fixer, ['SetMinTolerance'], [[1e-7]]);
+      tryCallAnyArgs(fixer, ['SetMaxTolerance'], [[1e-4]]);
+      tryCallAnyArgs(fixer, ['Perform'], [[makeInstance(oc, 'Message_ProgressRange')], []]);
+      const fixed = callAny(fixer, ['Shape']);
+      return fixed && !callAny(fixed, ['IsNull']) ? fixed : shape;
+    } catch {
+      return shape;
+    }
+  }
+}
+
+function sewShape(oc, shape) {
+  const attempts = [
+    () => makeInstance(oc, 'BRepBuilderAPI_Sewing', [1e-6, true, true, true, false]),
+    () => makeInstance(oc, 'BRepBuilderAPI_Sewing', [1e-5, true, true, true, false]),
+    () => makeInstance(oc, 'BRepBuilderAPI_FastSewing', [1e-6])
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const sewing = attempt();
+
+      if (typeof sewing.Load === 'function') {
+        sewing.Load(shape);
+      } else {
+        callAny(sewing, ['Add_1', 'Add'], [shape]);
+      }
+
+      tryCallAnyArgs(sewing, ['SetSameParameterMode'], [[true]]);
+      tryCallAnyArgs(sewing, ['SetNonManifoldMode'], [[false]]);
+      tryCallAnyArgs(sewing, ['Perform'], [[makeInstance(oc, 'Message_ProgressRange')], []]);
+
+      const sewed = tryCallAnyArgs(sewing, ['SewedShape', 'GetResult'], [[]]);
+
+      if (sewed.called && sewed.value && !callAny(sewed.value, ['IsNull'])) {
+        return sewed.value;
+      }
+    } catch {
+      // Try the next sewing implementation/tolerance.
+    }
+  }
+
+  return shape;
+}
+
+function collectShells(oc, shape) {
+  const shells = [];
+  const explorer = makeExplorer(oc, shape, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_SHELL'));
+
+  for (; callAny(explorer, ['More']); callAny(explorer, ['Next'])) {
+    shells.push(shellFromExplorer(oc, explorer));
+  }
+
+  return shells;
+}
+
+function makeSolidFromShell(oc, shell) {
+  try {
+    const solidFixer = makeInstance(oc, 'ShapeFix_Solid');
+    const solid = callAny(solidFixer, ['SolidFromShell'], [shell]);
+
+    if (solid && !callAny(solid, ['IsNull'])) {
+      return solid;
+    }
+  } catch {
+    // Fall through to BRepBuilderAPI_MakeSolid.
+  }
+
+  try {
+    const builder = makeInstance(oc, 'BRepBuilderAPI_MakeSolid', [shell]);
+    const done = tryCallAnyArgs(builder, ['IsDone'], [[]]);
+
+    if (done.called && !done.value) {
+      return null;
+    }
+
+    const solid = callAny(builder, ['Solid']);
+    return solid && !callAny(solid, ['IsNull']) ? solid : null;
+  } catch {
+    return null;
+  }
+}
+
+function convertSewnShapeToSolids(oc, shape) {
+  const shells = collectShells(oc, shape);
+
+  if (shells.length === 0) {
+    return shape;
+  }
+
+  const solids = shells
+    .map((shell) => makeSolidFromShell(oc, shell))
+    .filter(Boolean);
+
+  if (solids.length === 0) {
+    return shape;
+  }
+
+  return solids.length === 1 ? solids[0] : makeCompoundFromShapes(oc, solids);
+}
+
+function convertCutShapeToSolid(oc, shape) {
+  const fixedBeforeSewing = fixShape(oc, shape);
+  const sewed = sewShape(oc, fixedBeforeSewing);
+  const solid = convertSewnShapeToSolids(oc, sewed);
+  return fixShape(oc, solid || sewed || fixedBeforeSewing || shape);
+}
+
 function tryParametricApexConeUSplit(oc, shape, face, faceSurface, uSplitValues, bounds) {
   const tolerance = Math.max(1e-8, Math.abs(bounds.uLast - bounds.uFirst) * 1e-8);
   const intervals = [
@@ -2066,7 +2202,12 @@ export async function loadStepWithOpenCascade(buffer, draftAngleDegrees, options
     splitResult = splitPrimitiveFacesBySurfacesBatch(oc, shape, draftAngleDegrees);
   }
 
-  shape = splitResult.shape;
+  shape = convertCutShapeToSolid(oc, splitResult.shape);
+  splitResult.shape = shape;
+  splitResult.diagnostics.solidConversion = {
+    attempted: true,
+    facesAfter: countFaces(oc, shape)
+  };
   const splitStepText = writeStepShape(oc, shape);
   return buildRenderModelFromShape(oc, shape, splitResult, splitStepText, {
     classifyDraftFaces: true,
