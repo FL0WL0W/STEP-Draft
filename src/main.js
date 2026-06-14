@@ -407,6 +407,16 @@ function makeBoundaryGeometryFromOcctEdges(mesh) {
   return geometry;
 }
 
+function makeDraftBoundaryGeometry(mesh) {
+  if (!mesh.draftBoundaryEdgePositions || mesh.draftBoundaryEdgePositions.length === 0) {
+    return null;
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(mesh.draftBoundaryEdgePositions, 3));
+  return geometry;
+}
+
 function addMeshToScene(mesh, failedFaceIndices, mixedFaceIndices, faceIndexOffset) {
   const geometry = makeMeshGeometry(mesh);
   const brepFaces = mesh.brep_faces || mesh.brepFaces || [];
@@ -443,9 +453,28 @@ function addMeshToScene(mesh, failedFaceIndices, mixedFaceIndices, faceIndexOffs
   }
 
   const edgeGeometry = makeBoundaryGeometryFromOcctEdges(mesh);
+  const draftBoundaryGeometry = makeDraftBoundaryGeometry(mesh);
+  let draftBoundarySegments = 0;
+
+  if (draftBoundaryGeometry) {
+    const draftBoundaryMaterial = new THREE.LineBasicMaterial({
+      color: 0x18d7ff,
+      transparent: true,
+      opacity: 0.98,
+      depthTest: false,
+      depthWrite: false
+    });
+    const draftBoundaries = new THREE.LineSegments(draftBoundaryGeometry, draftBoundaryMaterial);
+    draftBoundaries.name = `${solid.name} draft boundaries`;
+    draftBoundaries.renderOrder = 12;
+    modelRoot.add(draftBoundaries);
+    draftBoundarySegments = draftBoundaryGeometry.getAttribute('position').count / 2;
+  }
+
   if (!edgeGeometry) {
     return {
       boundarySegments: 0,
+      draftBoundarySegments,
       failedTriangles: failedTriangleCount,
       failedFaces: brepFaces.filter((face, localFaceIndex) => failedFaceIndices.has(renderedFaceIndex(face, localFaceIndex, faceIndexOffset))).length,
       mixedFaces: brepFaces.filter((face, localFaceIndex) => mixedFaceIndices.has(renderedFaceIndex(face, localFaceIndex, faceIndexOffset))).length,
@@ -457,15 +486,16 @@ function addMeshToScene(mesh, failedFaceIndices, mixedFaceIndices, faceIndexOffs
     color: 0x101318,
     transparent: true,
     opacity: 0.82,
-    depthTest: false,
+    depthTest: true,
     depthWrite: false
   });
   const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial);
   edges.name = `${solid.name} boundaries`;
-  edges.renderOrder = 10;
+  edges.renderOrder = 2;
   modelRoot.add(edges);
   return {
     boundarySegments: edgeGeometry.getAttribute('position').count / 2,
+    draftBoundarySegments,
     failedTriangles: failedTriangleCount,
     failedFaces: brepFaces.filter((face, localFaceIndex) => failedFaceIndices.has(renderedFaceIndex(face, localFaceIndex, faceIndexOffset))).length,
     mixedFaces: brepFaces.filter((face, localFaceIndex) => mixedFaceIndices.has(renderedFaceIndex(face, localFaceIndex, faceIndexOffset))).length,
@@ -527,13 +557,14 @@ function renderLoadedModel({ frame = true } = {}) {
       const meshStats = addMeshToScene(mesh, currentModel.failedFaceIndices, currentModel.mixedFaceIndices, faceIndexOffset);
       faceIndexOffset += meshStats.totalFaces;
       total.boundarySegments += meshStats.boundarySegments;
+      total.draftBoundarySegments += meshStats.draftBoundarySegments;
       total.failedTriangles += meshStats.failedTriangles;
       total.failedFaces += meshStats.failedFaces;
       total.mixedFaces += meshStats.mixedFaces;
       total.totalFaces += meshStats.totalFaces;
       return total;
     },
-    { boundarySegments: 0, failedTriangles: 0, failedFaces: 0, mixedFaces: 0, totalFaces: 0 }
+    { boundarySegments: 0, draftBoundarySegments: 0, failedTriangles: 0, failedFaces: 0, mixedFaces: 0, totalFaces: 0 }
   );
 
   centerModelPivot();

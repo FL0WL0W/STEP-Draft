@@ -331,38 +331,90 @@ function sampleEdgeCurve(oc, edge, helpers) {
   return points.flat();
 }
 
-function collectBoundaryLines(oc, shape, helpers) {
+function appendSegmentPositions(target, edgePositions) {
+  for (let index = 0; index + 5 < edgePositions.length; index += 3) {
+    target.push(
+      edgePositions[index],
+      edgePositions[index + 1],
+      edgePositions[index + 2],
+      edgePositions[index + 3],
+      edgePositions[index + 4],
+      edgePositions[index + 5]
+    );
+  }
+}
+
+function edgeGeometryKey(edgePositions, edgeHash) {
+  if (edgePositions.length >= 6) {
+    const pointKey = (offset) => [
+      Math.round(edgePositions[offset] * 1e6),
+      Math.round(edgePositions[offset + 1] * 1e6),
+      Math.round(edgePositions[offset + 2] * 1e6)
+    ].join(',');
+    const start = pointKey(0);
+    const end = pointKey(edgePositions.length - 3);
+
+    if (start !== end) {
+      return start < end ? `points:${start}|${end}` : `points:${end}|${start}`;
+    }
+
+    const midOffset = Math.floor((edgePositions.length / 6)) * 3;
+    return `closed:${start}|${pointKey(Math.min(midOffset, edgePositions.length - 3))}`;
+  }
+
+  return edgeHash !== null ? `hash:${edgeHash}` : null;
+}
+
+function collectBoundaryLines(oc, shape, faceDraftStates, helpers) {
   const positions = [];
-  const edgeKeys = new Set();
-  const explorer = helpers.makeExplorer(oc, shape, helpers.enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_EDGE'));
+  const draftBoundaryPositions = [];
+  const edgeRecords = new Map();
+  const faceExplorer = helpers.makeExplorer(oc, shape, helpers.enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_FACE'));
+  let faceIndex = 0;
 
-  for (; helpers.callAny(explorer, ['More']); helpers.callAny(explorer, ['Next'])) {
-    const edge = helpers.edgeFromExplorer(oc, explorer);
-    const edgeHash = typeof edge.HashCode === 'function' ? edge.HashCode(1000000007) : null;
-
-    if (edgeHash !== null && edgeKeys.has(edgeHash)) {
-      continue;
-    }
-
-    if (edgeHash !== null) {
-      edgeKeys.add(edgeHash);
-    }
-
+  function recordEdge(edge, faceState) {
     const edgePositions = sampleEdgeCurve(oc, edge, helpers);
+    const edgeHash = typeof edge.HashCode === 'function' ? edge.HashCode(1000000007) : null;
+    const key = edgeGeometryKey(edgePositions, edgeHash);
 
-    for (let index = 0; index + 5 < edgePositions.length; index += 3) {
-      positions.push(
-        edgePositions[index],
-        edgePositions[index + 1],
-        edgePositions[index + 2],
-        edgePositions[index + 3],
-        edgePositions[index + 4],
-        edgePositions[index + 5]
-      );
+    if (!key) {
+      return;
+    }
+
+    if (!edgeRecords.has(key)) {
+      edgeRecords.set(key, {
+        faceStates: new Set(),
+        positions: edgePositions
+      });
+    }
+
+    edgeRecords.get(key).faceStates.add(faceState);
+  }
+
+  for (; helpers.callAny(faceExplorer, ['More']); helpers.callAny(faceExplorer, ['Next'])) {
+    const face = helpers.faceFromExplorer(oc, faceExplorer);
+    const faceState = faceDraftStates.get(faceIndex) || 'pass';
+    const edgeExplorer = helpers.makeExplorer(oc, face, helpers.enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_EDGE'));
+
+    for (; helpers.callAny(edgeExplorer, ['More']); helpers.callAny(edgeExplorer, ['Next'])) {
+      recordEdge(helpers.edgeFromExplorer(oc, edgeExplorer), faceState);
+    }
+
+    faceIndex += 1;
+  }
+
+  for (const record of edgeRecords.values()) {
+    appendSegmentPositions(positions, record.positions);
+
+    if (record.faceStates.has('pass') && record.faceStates.has('fail')) {
+      appendSegmentPositions(draftBoundaryPositions, record.positions);
     }
   }
 
-  return positions;
+  return {
+    draftBoundaryPositions,
+    positions
+  };
 }
 
 export function buildRenderModelFromShape(oc, shape, splitResult, splitStepText = null, options = {}, helpers) {
@@ -376,6 +428,8 @@ export function buildRenderModelFromShape(oc, shape, splitResult, splitStepText 
     brep_faces: [],
     failedFaceIndices: new Set(),
     mixedFaceIndices: new Set(),
+    faceDraftStates: new Map(),
+    draftBoundaryEdgePositions: [],
     edgePositions: []
   };
 
@@ -385,11 +439,13 @@ export function buildRenderModelFromShape(oc, shape, splitResult, splitStepText 
   for (; helpers.callAny(explorer, ['More']); helpers.callAny(explorer, ['Next'])) {
     const face = helpers.faceFromExplorer(oc, explorer);
     const range = appendFaceTriangulation(oc, face, output, helpers);
+    const failsDraft = Boolean(options.classifyDraftFaces && faceFailsDraftRule(oc, face, options.draftAngleDegrees ?? 3, helpers));
+    output.faceDraftStates.set(faceIndex, failsDraft ? 'fail' : 'pass');
 
     if (range) {
       output.brep_faces.push({ ...range, faceIndex });
 
-      if (options.classifyDraftFaces && faceFailsDraftRule(oc, face, options.draftAngleDegrees ?? 3, helpers)) {
+      if (failsDraft) {
         output.failedFaceIndices.add(faceIndex);
       }
     }
@@ -405,7 +461,9 @@ export function buildRenderModelFromShape(oc, shape, splitResult, splitStepText 
     throw new Error('OpenCascade imported BRep faces, but produced no triangulation for rendering.');
   }
 
-  output.edgePositions = collectBoundaryLines(oc, shape, helpers);
+  const boundaryLines = collectBoundaryLines(oc, shape, output.faceDraftStates, helpers);
+  output.edgePositions = boundaryLines.positions;
+  output.draftBoundaryEdgePositions = boundaryLines.draftBoundaryPositions;
 
   return {
     meshes: [
@@ -424,6 +482,7 @@ export function buildRenderModelFromShape(oc, shape, splitResult, splitStepText 
           array: output.indices
         },
         brep_faces: output.brep_faces,
+        draftBoundaryEdgePositions: output.draftBoundaryEdgePositions,
         edgePositions: output.edgePositions,
         faceDraftClassification: Boolean(options.classifyDraftFaces)
       }
