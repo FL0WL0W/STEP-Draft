@@ -212,7 +212,7 @@ function sampleFaceUvCentroids(oc, face, helpers) {
   return samples;
 }
 
-function faceFailsDraftRule(oc, face, draftAngleDegrees, helpers) {
+export function faceFailsDraftRule(oc, face, draftAngleDegrees, helpers) {
   let surface;
 
   try {

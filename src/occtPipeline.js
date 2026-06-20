@@ -1,4 +1,7 @@
-import { buildRenderModelFromShape as buildRenderModelFromShapeCore } from './occtRenderModel.js';
+import {
+  buildRenderModelFromShape as buildRenderModelFromShapeCore,
+  faceFailsDraftRule
+} from './occtRenderModel.js';
 import {
   callAny,
   dereferenceHandle,
@@ -37,6 +40,7 @@ import {
   mergeSplitDiagnostics,
   surfaceStatsForDiagnostics
 } from './splitDiagnostics.js';
+import { generateDraftFaces } from './generateDraftFaces.js';
 import {
   applyReplacementMap,
   collectFaceJobs,
@@ -367,6 +371,312 @@ function countFaces(oc, shape) {
   }
 
   return count;
+}
+
+function vertexFromExplorer(oc, explorer) {
+  const shape = callAny(explorer, ['Current']);
+
+  if (oc.TopoDS?.Vertex_1) {
+    return oc.TopoDS.Vertex_1(shape);
+  }
+
+  if (oc.TopoDS?.Vertex) {
+    return oc.TopoDS.Vertex(shape);
+  }
+
+  return shape;
+}
+
+function shapeMinimumZ(oc, shape) {
+  const explorer = makeExplorer(oc, shape, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_VERTEX'));
+  let minimumZ = Number.POSITIVE_INFINITY;
+
+  for (; callAny(explorer, ['More']); callAny(explorer, ['Next'])) {
+    try {
+      const vertex = vertexFromExplorer(oc, explorer);
+      const point = callAny(oc.BRep_Tool, ['Pnt'], [vertex]);
+      minimumZ = Math.min(minimumZ, getCoord(point, 'Z'));
+    } catch {
+      // Keep scanning the remaining vertices.
+    }
+  }
+
+  return Number.isFinite(minimumZ) ? minimumZ : 0;
+}
+
+function triangleVertexIndexForDraft(triangle, localIndex) {
+  if (typeof triangle.Value === 'function') {
+    return triangle.Value(localIndex);
+  }
+
+  if (typeof triangle.Get === 'function') {
+    return triangle.Get(localIndex);
+  }
+
+  return triangle[localIndex - 1];
+}
+
+function transformedPointToArray(point, transform) {
+  let transformed = point;
+
+  if (transform) {
+    try {
+      transformed = callAny(point, ['Transformed'], [transform]);
+    } catch {
+      callAny(point, ['Transform'], [transform]);
+      transformed = point;
+    }
+  }
+
+  return [getCoord(transformed, 'X'), getCoord(transformed, 'Y'), getCoord(transformed, 'Z')];
+}
+
+function projectedTriangleArea(points) {
+  const [a, b, c] = points;
+  return (
+    (b[0] - a[0]) * (c[1] - a[1]) -
+    (b[1] - a[1]) * (c[0] - a[0])
+  ) * 0.5;
+}
+
+function projectedFaceTriangles(oc, face) {
+  const location = makeInstance(oc, 'TopLoc_Location');
+  const purposeCandidates = [
+    enumValue(oc, 'Poly_MeshPurpose', 'Poly_MeshPurpose_NONE'),
+    enumValue(oc, 'Poly_MeshPurpose', 'Poly_MeshPurpose_Shading'),
+    enumValue(oc, 'Poly_MeshPurpose', 'Poly_MeshPurpose_AnyFallback'),
+    0,
+    2,
+    0xffff
+  ];
+  const triangles = [];
+
+  for (const candidate of purposeCandidates) {
+    const meshPurpose = statusValue(candidate);
+
+    if (!Number.isFinite(meshPurpose)) {
+      continue;
+    }
+
+    try {
+      const triangulationHandle = oc.BRep_Tool.Triangulation(face, location, meshPurpose);
+
+      if (!triangulationHandle || callAny(triangulationHandle, ['IsNull'])) {
+        continue;
+      }
+
+      const triangulation = dereferenceHandle(triangulationHandle);
+      const transform = callAny(location, ['Transformation']);
+      const triangleCount = callAny(triangulation, ['NbTriangles']);
+
+      for (let triangleIndex = 1; triangleIndex <= triangleCount; triangleIndex += 1) {
+        const triangle = callAny(triangulation, ['Triangle'], [triangleIndex]);
+        const points = [1, 2, 3].map((localIndex) => {
+          const node = callAny(triangulation, ['Node'], [triangleVertexIndexForDraft(triangle, localIndex)]);
+          return transformedPointToArray(node, transform);
+        });
+
+        if (Math.abs(projectedTriangleArea(points)) > 1e-8) {
+          triangles.push(points);
+        }
+      }
+
+      return triangles;
+    } catch {
+      // Try the next triangulation purpose.
+    }
+  }
+
+  return triangles;
+}
+
+function pointKey(point) {
+  return [
+    Math.round(point[0] * 1e6),
+    Math.round(point[1] * 1e6),
+    Math.round(point[2] * 1e6)
+  ].join(',');
+}
+
+function edgeKeyFromPoints(points, edgeHash) {
+  if (points.length >= 2) {
+    const start = pointKey(points[0]);
+    const end = pointKey(points[points.length - 1]);
+
+    return start < end ? `${start}|${end}` : `${end}|${start}`;
+  }
+
+  return edgeHash !== null ? `hash:${edgeHash}` : null;
+}
+
+function sampledEdgePoints(oc, edge, samples = 8) {
+  try {
+    const curve = makeInstance(oc, 'BRepAdaptor_Curve', [edge]);
+    const first = callAny(curve, ['FirstParameter']);
+    const last = callAny(curve, ['LastParameter']);
+
+    if (!Number.isFinite(first) || !Number.isFinite(last)) {
+      return [];
+    }
+
+    const points = [];
+
+    for (let index = 0; index <= samples; index += 1) {
+      const t = first + ((last - first) * index) / samples;
+      points.push(pointToArray(callAny(curve, ['Value'], [t])));
+    }
+
+    return points;
+  } catch {
+    return [];
+  }
+}
+
+function occtHelpers() {
+  return {
+    callAny,
+    dereferenceHandle,
+    edgeFromExplorer,
+    enumValue,
+    faceFromExplorer,
+    getCoord,
+    makeExplorer,
+    makeInstance,
+    normalFromDerivatives,
+    pointToArray,
+    shapeOrientation,
+    statusValue,
+    tryCallAnyArgs
+  };
+}
+
+function triangulateShapeForDraftClassification(oc, shape) {
+  tryCallAnyArgs(oc.BRepTools, ['Clean'], [[shape, true], [shape]]);
+
+  const mesher = makeInstance(oc, 'BRepMesh_IncrementalMesh', [
+    shape,
+    0.025,
+    false,
+    0.15,
+    true
+  ]);
+
+  if (typeof mesher.Perform === 'function') {
+    mesher.Perform(makeInstance(oc, 'Message_ProgressRange'));
+  }
+}
+
+function collectDraftBoundaryEdges(oc, shape, draftAngleDegrees) {
+  triangulateShapeForDraftClassification(oc, shape);
+
+  const helpers = occtHelpers();
+  const edgeRecords = new Map();
+  const faceStates = [];
+  const faceCenters = [];
+  const faceTriangles = [];
+  const faces = [];
+  const faceExplorer = makeExplorer(oc, shape, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_FACE'));
+  let faceIndex = 0;
+
+  for (; callAny(faceExplorer, ['More']); callAny(faceExplorer, ['Next'])) {
+    const face = faceFromExplorer(oc, faceExplorer);
+    const failsDraft = faceFailsDraftRule(oc, face, draftAngleDegrees, helpers);
+    const edgeExplorer = makeExplorer(oc, face, enumValue(oc, 'TopAbs_ShapeEnum', 'TopAbs_EDGE'));
+    const facePoints = [];
+
+    faces.push(face);
+    faceStates[faceIndex] = failsDraft ? 'fail' : 'pass';
+    faceTriangles[faceIndex] = projectedFaceTriangles(oc, face);
+
+    for (; callAny(edgeExplorer, ['More']); callAny(edgeExplorer, ['Next'])) {
+      const edge = edgeFromExplorer(oc, edgeExplorer);
+      const points = sampledEdgePoints(oc, edge);
+      const key = edgeKeyFromPoints(points, typeof edge.HashCode === 'function' ? edge.HashCode(1000000007) : null);
+
+      if (!key) {
+        continue;
+      }
+
+      facePoints.push(...points);
+
+      if (!edgeRecords.has(key)) {
+        edgeRecords.set(key, { edge, faces: [], points });
+      }
+
+      edgeRecords.get(key).faces.push(faceIndex);
+    }
+
+    if (facePoints.length > 0) {
+      const sum = facePoints.reduce((acc, point) => [
+        acc[0] + point[0],
+        acc[1] + point[1],
+        acc[2] + point[2]
+      ], [0, 0, 0]);
+      faceCenters[faceIndex] = [
+        sum[0] / facePoints.length,
+        sum[1] / facePoints.length,
+        sum[2] / facePoints.length
+      ];
+    }
+
+    faceIndex += 1;
+  }
+
+  const boundaryEdges = [];
+
+  for (const record of edgeRecords.values()) {
+    const passingFaceIndex = record.faces.find((index) => faceStates[index] === 'pass');
+    const failingFaceIndex = record.faces.find((index) => faceStates[index] === 'fail');
+
+    if (passingFaceIndex === undefined || failingFaceIndex === undefined) {
+      continue;
+    }
+
+    boundaryEdges.push({
+      edge: record.edge,
+      failingFaceIndex,
+      passingFaceCenter: faceCenters[passingFaceIndex] || null,
+      passingFaceIndex,
+      passingFaceTriangles: faceTriangles[passingFaceIndex] || [],
+      points: record.points
+    });
+  }
+
+  return {
+    boundaryEdges,
+    faceStates,
+    faces
+  };
+}
+
+function deleteDraftFailingFaces(oc, shape, classifiedFaces) {
+  const passingFaces = classifiedFaces.faces.filter((_, index) => classifiedFaces.faceStates[index] !== 'fail');
+  const failedFaces = classifiedFaces.faces.length - passingFaces.length;
+
+  if (failedFaces === 0) {
+    return {
+      failedFaces: 0,
+      removedFaces: 0,
+      shape
+    };
+  }
+
+  const compound = makeCompoundFromShapes(oc, passingFaces);
+
+  return {
+    failedFaces,
+    method: 'passing-face-compound',
+    removedFaces: failedFaces,
+    shape: compound
+  };
+}
+
+function appendGeneratedFaces(oc, shape, generatedFaces) {
+  if (!generatedFaces || generatedFaces.length === 0) {
+    return shape;
+  }
+
+  return makeCompoundFromShapes(oc, [...collectFaces(oc, shape), ...generatedFaces]);
 }
 
 function collectShapeEdges(oc, shape) {
@@ -2151,21 +2461,7 @@ export async function createStepFaceProcessor(buffer, options = {}) {
 }
 
 function buildRenderModelFromShape(oc, shape, splitResult, splitStepText = null, options = {}) {
-  return buildRenderModelFromShapeCore(oc, shape, splitResult, splitStepText, options, {
-    callAny,
-    dereferenceHandle,
-    edgeFromExplorer,
-    enumValue,
-    faceFromExplorer,
-    getCoord,
-    makeExplorer,
-    makeInstance,
-    normalFromDerivatives,
-    pointToArray,
-    shapeOrientation,
-    statusValue,
-    tryCallAnyArgs
-  });
+  return buildRenderModelFromShapeCore(oc, shape, splitResult, splitStepText, options, occtHelpers());
 }
 
 export async function loadStepWithOpenCascade(buffer, draftAngleDegrees, options = {}) {
@@ -2204,9 +2500,34 @@ export async function loadStepWithOpenCascade(buffer, draftAngleDegrees, options
 
   shape = convertCutShapeToSolid(oc, splitResult.shape);
   splitResult.shape = shape;
+  const groundZ = shapeMinimumZ(oc, shape);
+  const classifiedFaces = collectDraftBoundaryEdges(oc, shape, draftAngleDegrees);
   splitResult.diagnostics.solidConversion = {
     attempted: true,
     facesAfter: countFaces(oc, shape)
+  };
+  const deletionResult = deleteDraftFailingFaces(oc, shape, classifiedFaces);
+  shape = deletionResult.shape;
+  splitResult.shape = shape;
+  splitResult.diagnostics.deletedDraftFailingFaces = {
+    attempted: true,
+    boundaryEdges: classifiedFaces.boundaryEdges.length,
+    failedFaces: deletionResult.failedFaces,
+    facesAfter: countFaces(oc, shape),
+    groundZ,
+    method: deletionResult.method,
+    removedFaces: deletionResult.removedFaces
+  };
+  const generatedDraftFaces = generateDraftFaces(oc, classifiedFaces.boundaryEdges, {
+    draftAngleDegrees,
+    groundZ
+  });
+  shape = appendGeneratedFaces(oc, shape, generatedDraftFaces.faces);
+  splitResult.shape = shape;
+  splitResult.diagnostics.generatedDraftFaces = {
+    ...generatedDraftFaces.stats,
+    facesAfter: countFaces(oc, shape),
+    groundZ
   };
   const splitStepText = writeStepShape(oc, shape);
   return buildRenderModelFromShape(oc, shape, splitResult, splitStepText, {
