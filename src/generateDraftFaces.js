@@ -1,8 +1,15 @@
-import { callAny, enumValue, makeInstance, tryCallAnyArgs } from './occtRuntime.js';
+import { callAny, dereferenceHandle, enumValue, makeInstance, tryCallAnyArgs } from './occtRuntime.js';
 
-const LINE_TOLERANCE = 1e-5;
 const SIDE_TEST_TOLERANCE = 1e-8;
 const ANGLE_TOLERANCE = 1e-5;
+
+function increment(stats, key) {
+  if (!stats) {
+    return;
+  }
+
+  stats[key] = (stats[key] || 0) + 1;
+}
 
 function add(a, b) {
   return [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
@@ -61,50 +68,77 @@ function angleInCcwSector(angle, start, end) {
   return ccwDelta(start, angle) <= ccwDelta(start, end) + ANGLE_TOLERANCE;
 }
 
-function projectedDistanceToSegment(point, start, end) {
-  const vx = end[0] - start[0];
-  const vy = end[1] - start[1];
-  const wx = point[0] - start[0];
-  const wy = point[1] - start[1];
-  const lengthSquared = vx * vx + vy * vy;
-
-  if (lengthSquared <= 1e-18) {
-    return Math.hypot(point[0] - start[0], point[1] - start[1]);
-  }
-
-  const t = Math.min(Math.max((wx * vx + wy * vy) / lengthSquared, 0), 1);
-  return Math.hypot(
-    point[0] - (start[0] + vx * t),
-    point[1] - (start[1] + vy * t)
-  );
-}
-
-function lineLikePoints(points) {
-  if (!points || points.length < 2) {
-    return false;
-  }
-
-  const start = points[0];
-  const end = points[points.length - 1];
-  const length = Math.hypot(end[0] - start[0], end[1] - start[1], end[2] - start[2]);
-  const tolerance = Math.max(LINE_TOLERANCE, length * 1e-5);
-
-  return points.every((point) => projectedDistanceToSegment(point, start, end) <= tolerance);
-}
-
-function edgeIsStraight(oc, edge, points) {
+function edgeIsStraight(oc, edge) {
   try {
     const curve = makeInstance(oc, 'BRepAdaptor_Curve', [edge]);
     const type = callAny(curve, ['GetType']);
 
-    if (type === enumValue(oc, 'GeomAbs_CurveType', 'GeomAbs_Line')) {
-      return true;
-    }
+    return type === enumValue(oc, 'GeomAbs_CurveType', 'GeomAbs_Line');
   } catch {
-    // Fall back to sampled geometry.
+    return false;
+  }
+}
+
+function enumKey(value) {
+  if (typeof value === 'number' || typeof value === 'string') {
+    return String(value);
   }
 
-  return lineLikePoints(points);
+  if (typeof value?.value === 'number' || typeof value?.value === 'string') {
+    return String(value.value);
+  }
+
+  return String(value);
+}
+
+function curveTypeName(oc, type) {
+  const knownTypes = [
+    'GeomAbs_Line',
+    'GeomAbs_Circle',
+    'GeomAbs_Ellipse',
+    'GeomAbs_Hyperbola',
+    'GeomAbs_Parabola',
+    'GeomAbs_BezierCurve',
+    'GeomAbs_BSplineCurve',
+    'GeomAbs_OffsetCurve',
+    'GeomAbs_OtherCurve'
+  ];
+
+  for (const name of knownTypes) {
+    if (enumKey(type) === enumKey(enumValue(oc, 'GeomAbs_CurveType', name))) {
+      return name.replace('GeomAbs_', '');
+    }
+  }
+
+  return `rawType:${enumKey(type)}`;
+}
+
+function recordBoundaryEdgeCurveType(oc, edge, stats) {
+  if (!stats) {
+    return;
+  }
+
+  if (!stats.boundaryEdgeCurveTypes) {
+    stats.boundaryEdgeCurveTypes = {};
+  }
+
+  try {
+    const curve = makeInstance(oc, 'BRepAdaptor_Curve', [edge]);
+    const type = callAny(curve, ['GetType']);
+    const key = curveTypeName(oc, type);
+
+    stats.boundaryEdgeCurveTypes[key] = (stats.boundaryEdgeCurveTypes[key] || 0) + 1;
+  } catch {
+    stats.boundaryEdgeCurveTypes.unreadable = (stats.boundaryEdgeCurveTypes.unreadable || 0) + 1;
+  }
+}
+
+function upcastToGeomSurfaceHandle(oc, surfaceHandle) {
+  try {
+    return makeInstance(oc, 'Handle_Geom_Surface', [dereferenceHandle(surfaceHandle)]);
+  } catch {
+    return surfaceHandle;
+  }
 }
 
 function projectedTriangleArea(points) {
@@ -234,6 +268,216 @@ function horizontalCircleData(oc, edge) {
   } catch {
     return null;
   }
+}
+
+function verticalCircleData(oc, edge) {
+  try {
+    const curve = makeInstance(oc, 'BRepAdaptor_Curve', [edge]);
+    const type = callAny(curve, ['GetType']);
+
+    if (type !== enumValue(oc, 'GeomAbs_CurveType', 'GeomAbs_Circle')) {
+      return null;
+    }
+
+    const circle = callAny(curve, ['Circle']);
+    const position = callAny(circle, ['Position']);
+    const direction = pointToArray(callAny(position, ['Direction']));
+
+    if (Math.abs(direction[2]) > 1e-5) {
+      return null;
+    }
+
+    return {
+      center: pointToArray(callAny(circle, ['Location'])),
+      circle,
+      direction,
+      first: callAny(curve, ['FirstParameter']),
+      last: callAny(curve, ['LastParameter']),
+      radius: callAny(circle, ['Radius'])
+    };
+  } catch {
+    return null;
+  }
+}
+
+function circleFromThreeLocalPoints(a, b, c) {
+  const d = 2 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
+
+  if (Math.abs(d) <= 1e-12) {
+    return null;
+  }
+
+  const ux = (
+    (a[0] * a[0] + a[1] * a[1]) * (b[1] - c[1]) +
+    (b[0] * b[0] + b[1] * b[1]) * (c[1] - a[1]) +
+    (c[0] * c[0] + c[1] * c[1]) * (a[1] - b[1])
+  ) / d;
+  const uy = (
+    (a[0] * a[0] + a[1] * a[1]) * (c[0] - b[0]) +
+    (b[0] * b[0] + b[1] * b[1]) * (a[0] - c[0]) +
+    (c[0] * c[0] + c[1] * c[1]) * (b[0] - a[0])
+  ) / d;
+  const radius = Math.hypot(a[0] - ux, a[1] - uy);
+
+  return Number.isFinite(radius) && radius > 1e-7
+    ? { center: [ux, uy], radius }
+    : null;
+}
+
+function fittedVerticalCircleData(points, stats) {
+  if (!points || points.length < 5) {
+    increment(stats, 'verticalCircleFitRejectedTooFewPoints');
+    return null;
+  }
+
+  let minZPoint = points[0];
+  let maxZPoint = points[0];
+
+  for (const point of points) {
+    if (point[2] < minZPoint[2]) {
+      minZPoint = point;
+    }
+
+    if (point[2] > maxZPoint[2]) {
+      maxZPoint = point;
+    }
+  }
+
+  let start = null;
+  let end = null;
+  let bestDistance = 0;
+
+  for (let left = 0; left < points.length; left += 1) {
+    for (let right = left + 1; right < points.length; right += 1) {
+      const distance = Math.hypot(points[right][0] - points[left][0], points[right][1] - points[left][1]);
+
+      if (distance > bestDistance) {
+        bestDistance = distance;
+        start = [points[left][0], points[left][1], 0];
+        end = [points[right][0], points[right][1], 0];
+      }
+    }
+  }
+
+  if (!start || !end || bestDistance <= 1e-6) {
+    increment(stats, 'verticalCircleFitRejectedNoHorizontalSpan');
+    return null;
+  }
+
+  const axis = normalize([end[0] - start[0], end[1] - start[1], 0]);
+
+  if (!axis) {
+    increment(stats, 'verticalCircleFitRejectedNoHorizontalSpan');
+    return null;
+  }
+
+  const planeTolerance = Math.max(
+    Math.hypot(points[points.length - 1][0] - points[0][0], points[points.length - 1][1] - points[0][1]) * 1e-4,
+    1e-5
+  );
+
+  for (const point of points) {
+    const offsetX = point[0] - start[0];
+    const offsetY = point[1] - start[1];
+    const distanceFromPlane = Math.abs(offsetX * -axis[1] + offsetY * axis[0]);
+
+    if (distanceFromPlane > planeTolerance) {
+      increment(stats, 'verticalCircleFitRejectedNotVerticalPlane');
+      return null;
+    }
+  }
+
+  const localPoints = points.map((point) => [
+    (point[0] - start[0]) * axis[0] + (point[1] - start[1]) * axis[1],
+    point[2]
+  ]);
+  const localSpread = localPoints.reduce((range, point) => ({
+    max: Math.max(range.max, point[0]),
+    min: Math.min(range.min, point[0])
+  }), { max: Number.NEGATIVE_INFINITY, min: Number.POSITIVE_INFINITY });
+
+  if (localSpread.max - localSpread.min <= 1e-6 || maxZPoint[2] - minZPoint[2] <= 1e-6) {
+    increment(stats, 'verticalCircleFitRejectedInsufficientSpread');
+    return null;
+  }
+
+  const circle = circleFromThreeLocalPoints(
+    localPoints[0],
+    localPoints[Math.floor(localPoints.length / 2)],
+    localPoints[localPoints.length - 1]
+  );
+
+  if (!circle) {
+    increment(stats, 'verticalCircleFitRejectedNoCircle');
+    return null;
+  }
+
+  const tolerance = Math.max(circle.radius * 2e-3, 1e-4);
+
+  for (const point of localPoints) {
+    if (Math.abs(Math.hypot(point[0] - circle.center[0], point[1] - circle.center[1]) - circle.radius) > tolerance) {
+      increment(stats, 'verticalCircleFitRejectedRadialError');
+      return null;
+    }
+  }
+
+  const center = [
+    start[0] + axis[0] * circle.center[0],
+    start[1] + axis[1] * circle.center[0],
+    circle.center[1]
+  ];
+  const direction = normalize([-axis[1], axis[0], 0]);
+
+  if (!direction) {
+    increment(stats, 'verticalCircleFitRejectedNoDirection');
+    return null;
+  }
+
+  increment(stats, 'verticalCircleFittedCandidates');
+
+  return {
+    center,
+    direction,
+    fitted: true,
+    radius: circle.radius
+  };
+}
+
+function outwardDirectionForVerticalCircle(boundaryEdge, circleData) {
+  const normal = normalize([circleData.direction[0], circleData.direction[1], 0]);
+
+  if (!normal) {
+    return null;
+  }
+
+  const sideOffset = Math.max((circleData.radius || 1) * 1e-4, 1e-4);
+  let positiveCoverage = 0;
+  let negativeCoverage = 0;
+
+  for (const point of boundaryEdge.points) {
+    positiveCoverage += pointCoverageScore(point, normal, boundaryEdge.passingFaceTriangles, sideOffset);
+    negativeCoverage += pointCoverageScore(point, scale(normal, -1), boundaryEdge.passingFaceTriangles, sideOffset);
+  }
+
+  if (positiveCoverage !== negativeCoverage) {
+    return positiveCoverage < negativeCoverage ? normal : scale(normal, -1);
+  }
+
+  if (boundaryEdge.passingFaceCenter) {
+    const passingSide = [
+      boundaryEdge.passingFaceCenter[0] - circleData.center[0],
+      boundaryEdge.passingFaceCenter[1] - circleData.center[1],
+      0
+    ];
+
+    if (Math.hypot(passingSide[0], passingSide[1]) > 1e-9) {
+      return normal[0] * passingSide[0] + normal[1] * passingSide[1] < 0
+        ? normal
+        : scale(normal, -1);
+    }
+  }
+
+  return normal;
 }
 
 function circularDraftRadialSign(boundaryEdge, circleData) {
@@ -434,6 +678,82 @@ function makeFaceFromPoints(oc, points) {
   return null;
 }
 
+function makeBSplineSurfaceFromPointGrid(oc, pointGrid) {
+  const rowCount = pointGrid.length;
+  const colCount = pointGrid[0]?.length || 0;
+
+  if (rowCount < 2 || colCount < 2) {
+    return null;
+  }
+
+  const points = makeInstance(oc, 'TColgp_Array2OfPnt', [1, rowCount, 1, colCount]);
+
+  for (let row = 0; row < rowCount; row += 1) {
+    for (let col = 0; col < colCount; col += 1) {
+      callAny(points, ['SetValue'], [row + 1, col + 1, makeInstance(oc, 'gp_Pnt', pointGrid[row][col])]);
+    }
+  }
+
+  const attempts = [
+    () => makeInstance(oc, 'GeomAPI_PointsToBSplineSurface', [
+      points,
+      3,
+      8,
+      enumValue(oc, 'GeomAbs_Shape', 'GeomAbs_C2'),
+      1e-4
+    ]),
+    () => makeInstance(oc, 'GeomAPI_PointsToBSplineSurface', [points])
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const builder = attempt();
+
+      if (!callAny(builder, ['IsDone'])) {
+        continue;
+      }
+
+      return upcastToGeomSurfaceHandle(oc, callAny(builder, ['Surface']));
+    } catch {
+      // Try the next overload.
+    }
+  }
+
+  return null;
+}
+
+function makeSmoothFaceFromPointGrid(oc, pointGrid) {
+  const surfaceHandle = makeBSplineSurfaceFromPointGrid(oc, pointGrid);
+
+  if (!surfaceHandle) {
+    return null;
+  }
+
+  const attempts = [
+    () => makeInstance(oc, 'BRepBuilderAPI_MakeFace', [surfaceHandle, 1e-7]),
+    () => makeInstance(oc, 'BRepBuilderAPI_MakeFace', [surfaceHandle, true, 1e-7]),
+    () => makeInstance(oc, 'BRepBuilderAPI_MakeFace', [surfaceHandle, 0, 1, 0, 1, 1e-7])
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const builder = attempt();
+      const done = tryCallAnyArgs(builder, ['IsDone'], [[]]);
+
+      if (done.called && !done.value) {
+        continue;
+      }
+
+      const face = callAny(builder, ['Face']);
+      return callAny(face, ['IsNull']) ? null : face;
+    } catch {
+      // Try the next overload.
+    }
+  }
+
+  return null;
+}
+
 function draftedBottomPoint(point, outwardDirection, groundZ, draftAngleDegrees) {
   const height = Math.max(point[2] - groundZ, 0);
   const horizontalOffset = Math.tan((draftAngleDegrees * Math.PI) / 180) * height;
@@ -449,7 +769,7 @@ function generateStraightBoundaryFace(oc, boundaryEdge, options) {
   const { draftAngleDegrees, groundZ } = options;
   const { edge, points } = boundaryEdge;
 
-  if (!edgeIsStraight(oc, edge, points) || points.length < 2 || !Number.isFinite(groundZ)) {
+  if (!edgeIsStraight(oc, edge) || points.length < 2 || !Number.isFinite(groundZ)) {
     return null;
   }
 
@@ -487,6 +807,93 @@ function generateStraightBoundaryFace(oc, boundaryEdge, options) {
         key: pointKey(end),
         point: end,
         tangent: normalize([start[0] - end[0], start[1] - end[1], 0])
+      }
+    ],
+    face
+  };
+}
+
+function generateVerticalCircleBoundaryFace(oc, boundaryEdge, options, stats) {
+  const { draftAngleDegrees, groundZ } = options;
+  increment(stats, 'verticalCircleDetectionAttempts');
+
+  const occtCircleData = verticalCircleData(oc, boundaryEdge.edge);
+
+  if (occtCircleData) {
+    increment(stats, 'verticalCircleOcctCandidates');
+  }
+
+  const circleData = occtCircleData || fittedVerticalCircleData(boundaryEdge.points, stats);
+
+  if (!circleData) {
+    increment(stats, 'verticalCircleRejectedNoCircleData');
+    return null;
+  }
+
+  increment(stats, 'verticalCircleCandidates');
+
+  if (!Number.isFinite(circleData.radius)) {
+    increment(stats, 'verticalCircleRejectedInvalidRadius');
+    return null;
+  }
+
+  if (!Number.isFinite(groundZ)) {
+    increment(stats, 'verticalCircleRejectedInvalidGroundZ');
+    return null;
+  }
+
+  if (boundaryEdge.points.length < 3) {
+    increment(stats, 'verticalCircleRejectedTooFewPoints');
+    return null;
+  }
+
+  const outwardDirection = outwardDirectionForVerticalCircle(boundaryEdge, circleData);
+
+  if (!outwardDirection) {
+    increment(stats, 'verticalCircleRejectedNoOutwardDirection');
+    return null;
+  }
+
+  const start = boundaryEdge.points[0];
+  const end = boundaryEdge.points[boundaryEdge.points.length - 1];
+  const topRow = boundaryEdge.points;
+  const bottomRow = topRow.map((point) => draftedBottomPoint(point, outwardDirection, groundZ, draftAngleDegrees));
+  const pointGrid = [0, 1 / 3, 2 / 3, 1].map((t) => topRow.map((point, index) => [
+    point[0] + (bottomRow[index][0] - point[0]) * t,
+    point[1] + (bottomRow[index][1] - point[1]) * t,
+    point[2] + (bottomRow[index][2] - point[2]) * t
+  ]));
+  const face = makeSmoothFaceFromPointGrid(oc, pointGrid);
+
+  if (!face) {
+    increment(stats, 'verticalCircleRejectedNoFace');
+    return null;
+  }
+
+  const startTangentPoint = topRow[1] || end;
+  const endTangentPoint = topRow[topRow.length - 2] || start;
+
+  return {
+    endpoints: [
+      {
+        draftDirection: outwardDirection,
+        key: pointKey(start),
+        point: start,
+        tangent: normalize([
+          startTangentPoint[0] - start[0],
+          startTangentPoint[1] - start[1],
+          0
+        ])
+      },
+      {
+        draftDirection: outwardDirection,
+        key: pointKey(end),
+        point: end,
+        tangent: normalize([
+          endTangentPoint[0] - end[0],
+          endTangentPoint[1] - end[1],
+          0
+        ])
       }
     ],
     face
@@ -729,15 +1136,28 @@ export function generateDraftFaces(oc, boundaryEdges, options = {}) {
   const faces = [];
   const endpointRecords = [];
   const stats = {
+    boundaryEdgeCurveTypes: {},
     boundaryEdges: boundaryEdges.length,
     generatedConeFaces: 0,
     generatedCornerGapFaces: 0,
     generatedStraightFaces: 0,
+    generatedVerticalCircleFaces: 0,
     skippedCornerGaps: 0,
     skippedEdges: 0
   };
 
   for (const boundaryEdge of boundaryEdges) {
+    recordBoundaryEdgeCurveType(oc, boundaryEdge.edge, stats);
+
+    const verticalCircleFace = generateVerticalCircleBoundaryFace(oc, boundaryEdge, options, stats);
+
+    if (verticalCircleFace) {
+      faces.push(verticalCircleFace.face);
+      endpointRecords.push(...verticalCircleFace.endpoints.filter((endpoint) => endpoint.tangent));
+      stats.generatedVerticalCircleFaces += 1;
+      continue;
+    }
+
     const straightFace = generateStraightBoundaryFace(oc, boundaryEdge, options);
 
     if (straightFace) {
