@@ -106,6 +106,20 @@ function sideCoverageScore(edgeStart, edgeEnd, sideDirection, triangles, offset)
   }, 0);
 }
 
+function pointCoverageScore(point, direction, triangles, offset) {
+  if (!triangles || triangles.length === 0) {
+    return 0;
+  }
+
+  const sample = [
+    point[0] + direction[0] * offset,
+    point[1] + direction[1] * offset,
+    0
+  ];
+
+  return triangles.some((triangle) => pointInProjectedTriangle(sample, triangle)) ? 1 : 0;
+}
+
 function outwardDirectionForStraightEdge(edgeStart, edgeEnd, boundaryEdge) {
   const edgeDirection = normalize([edgeEnd[0] - edgeStart[0], edgeEnd[1] - edgeStart[1], 0]);
 
@@ -142,6 +156,158 @@ function outwardDirectionForStraightEdge(edgeStart, edgeEnd, boundaryEdge) {
   }
 
   return candidates[0];
+}
+
+function pointToArray(point) {
+  return [
+    callAny(point, ['X']),
+    callAny(point, ['Y']),
+    callAny(point, ['Z'])
+  ];
+}
+
+function horizontalCircleData(oc, edge) {
+  try {
+    const curve = makeInstance(oc, 'BRepAdaptor_Curve', [edge]);
+    const type = callAny(curve, ['GetType']);
+
+    if (type !== enumValue(oc, 'GeomAbs_CurveType', 'GeomAbs_Circle')) {
+      return null;
+    }
+
+    const circle = callAny(curve, ['Circle']);
+    const position = callAny(circle, ['Position']);
+    const direction = pointToArray(callAny(position, ['Direction']));
+
+    if (Math.abs(Math.abs(direction[2]) - 1) > 1e-5) {
+      return null;
+    }
+
+    return {
+      center: pointToArray(callAny(circle, ['Location'])),
+      circle,
+      direction,
+      first: callAny(curve, ['FirstParameter']),
+      last: callAny(curve, ['LastParameter']),
+      radius: callAny(circle, ['Radius'])
+    };
+  } catch {
+    return null;
+  }
+}
+
+function circularDraftRadialSign(boundaryEdge, circleData) {
+  const { center, radius } = circleData;
+  const sideOffset = Math.max((radius || 1) * 1e-4, 1e-4);
+  let outwardCoverage = 0;
+  let inwardCoverage = 0;
+  let sampleCount = 0;
+
+  for (const point of boundaryEdge.points) {
+    const radial = normalize([point[0] - center[0], point[1] - center[1], 0]);
+
+    if (!radial) {
+      continue;
+    }
+
+    outwardCoverage += pointCoverageScore(point, radial, boundaryEdge.passingFaceTriangles, sideOffset);
+    inwardCoverage += pointCoverageScore(point, scale(radial, -1), boundaryEdge.passingFaceTriangles, sideOffset);
+    sampleCount += 1;
+  }
+
+  if (sampleCount === 0) {
+    return null;
+  }
+
+  if (outwardCoverage !== inwardCoverage) {
+    return outwardCoverage < inwardCoverage ? 1 : -1;
+  }
+
+  if (boundaryEdge.passingFaceCenter) {
+    const midPoint = scale(boundaryEdge.points.reduce((sum, point) => add(sum, point), [0, 0, 0]), 1 / boundaryEdge.points.length);
+    const midRadial = normalize([midPoint[0] - center[0], midPoint[1] - center[1], 0]);
+    const passingSide = [
+      boundaryEdge.passingFaceCenter[0] - center[0],
+      boundaryEdge.passingFaceCenter[1] - center[1],
+      0
+    ];
+
+    if (midRadial && Math.hypot(passingSide[0], passingSide[1]) > 1e-9) {
+      return midRadial[0] * passingSide[0] + midRadial[1] * passingSide[1] < 0 ? 1 : -1;
+    }
+  }
+
+  return 1;
+}
+
+function normalizeAngle(angle) {
+  let value = angle;
+
+  while (value <= -Math.PI) {
+    value += Math.PI * 2;
+  }
+
+  while (value > Math.PI) {
+    value -= Math.PI * 2;
+  }
+
+  return value;
+}
+
+function coneUForPoint(point, center) {
+  return normalizeAngle(Math.atan2(center[1] - point[1], point[0] - center[0]));
+}
+
+function coneUBoundsFromArcPoints(points, center) {
+  const angles = points
+    .filter((point) => Math.hypot(point[0] - center[0], point[1] - center[1]) > 1e-7)
+    .map((point) => coneUForPoint(point, center));
+
+  if (angles.length < 2) {
+    return null;
+  }
+
+  const unwrapped = [angles[0]];
+
+  for (let index = 1; index < angles.length; index += 1) {
+    let angle = angles[index];
+    const previous = unwrapped[index - 1];
+
+    while (angle - previous > Math.PI) {
+      angle -= Math.PI * 2;
+    }
+
+    while (angle - previous < -Math.PI) {
+      angle += Math.PI * 2;
+    }
+
+    unwrapped.push(angle);
+  }
+
+  const span = unwrapped[unwrapped.length - 1] - unwrapped[0];
+
+  if (Math.abs(span) <= 1e-7) {
+    return null;
+  }
+
+  return span > 0
+    ? { uMin: unwrapped[0], uMax: unwrapped[unwrapped.length - 1] }
+    : { uMin: unwrapped[unwrapped.length - 1], uMax: unwrapped[0] };
+}
+
+function makeConeAxis(oc, center) {
+  const point = makeInstance(oc, 'gp_Pnt', center);
+  const direction = makeInstance(oc, 'gp_Dir', [0, 0, -1]);
+
+  try {
+    return makeInstance(oc, 'gp_Ax3', [
+      point,
+      direction,
+      makeInstance(oc, 'gp_Dir', [1, 0, 0])
+    ]);
+  } catch {
+    return makeInstance(oc, 'gp_Ax3', [point, direction]);
+  }
 }
 
 function makeEdge(oc, start, end) {
@@ -246,23 +412,100 @@ function generateStraightBoundaryFace(oc, boundaryEdge, options) {
   return makeFaceFromPoints(oc, [start, end, draftedEnd, draftedStart]);
 }
 
+function generateHorizontalCircleBoundaryFace(oc, boundaryEdge, options) {
+  const { draftAngleDegrees, groundZ } = options;
+  const circleData = horizontalCircleData(oc, boundaryEdge.edge);
+
+  if (
+    !circleData ||
+    !Number.isFinite(circleData.radius) ||
+    !Number.isFinite(circleData.center[2]) ||
+    !Number.isFinite(groundZ)
+  ) {
+    return null;
+  }
+
+  const height = circleData.center[2] - groundZ;
+
+  if (height <= 1e-7) {
+    return null;
+  }
+
+  const radialSign = circularDraftRadialSign(boundaryEdge, circleData);
+
+  if (!radialSign) {
+    return null;
+  }
+
+  const radiusOffset = Math.tan((draftAngleDegrees * Math.PI) / 180) * height * radialSign;
+  const bottomRadius = circleData.radius + radiusOffset;
+
+  if (bottomRadius <= 1e-7) {
+    return null;
+  }
+
+  const uBounds = coneUBoundsFromArcPoints(boundaryEdge.points, circleData.center);
+
+  if (!uBounds) {
+    return null;
+  }
+
+  const semiAngle = Math.atan2(radiusOffset, height);
+  const vMax = height / Math.cos(semiAngle);
+
+  if (!Number.isFinite(semiAngle) || !Number.isFinite(vMax) || Math.abs(vMax) <= 1e-7) {
+    return null;
+  }
+
+  try {
+    const cone = makeInstance(oc, 'gp_Cone', [makeConeAxis(oc, circleData.center), semiAngle, circleData.radius]);
+    const builder = makeInstance(oc, 'BRepBuilderAPI_MakeFace', [
+      cone,
+      uBounds.uMin,
+      uBounds.uMax,
+      0,
+      vMax
+    ]);
+    const done = tryCallAnyArgs(builder, ['IsDone'], [[]]);
+
+    if (done.called && !done.value) {
+      return null;
+    }
+
+    const face = callAny(builder, ['Face']);
+    return callAny(face, ['IsNull']) ? null : face;
+  } catch {
+    return null;
+  }
+}
+
 export function generateDraftFaces(oc, boundaryEdges, options = {}) {
   const faces = [];
   const stats = {
     boundaryEdges: boundaryEdges.length,
+    generatedConeFaces: 0,
     generatedStraightFaces: 0,
     skippedEdges: 0
   };
 
   for (const boundaryEdge of boundaryEdges) {
-    const face = generateStraightBoundaryFace(oc, boundaryEdge, options);
+    const straightFace = generateStraightBoundaryFace(oc, boundaryEdge, options);
 
-    if (face) {
-      faces.push(face);
+    if (straightFace) {
+      faces.push(straightFace);
       stats.generatedStraightFaces += 1;
-    } else {
-      stats.skippedEdges += 1;
+      continue;
     }
+
+    const coneFace = generateHorizontalCircleBoundaryFace(oc, boundaryEdge, options);
+
+    if (coneFace) {
+      faces.push(coneFace);
+      stats.generatedConeFaces += 1;
+      continue;
+    }
+
+    stats.skippedEdges += 1;
   }
 
   return { faces, stats };
