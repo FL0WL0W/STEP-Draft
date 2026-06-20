@@ -270,7 +270,7 @@ function horizontalCircleData(oc, edge) {
   }
 }
 
-function verticalCircleData(oc, edge) {
+function nonHorizontalCircleData(oc, edge) {
   try {
     const curve = makeInstance(oc, 'BRepAdaptor_Curve', [edge]);
     const type = callAny(curve, ['GetType']);
@@ -283,7 +283,7 @@ function verticalCircleData(oc, edge) {
     const position = callAny(circle, ['Position']);
     const direction = pointToArray(callAny(position, ['Direction']));
 
-    if (Math.abs(direction[2]) > 1e-5) {
+    if (Math.abs(Math.abs(direction[2]) - 1) <= 1e-5) {
       return null;
     }
 
@@ -443,41 +443,70 @@ function fittedVerticalCircleData(points, stats) {
   };
 }
 
-function outwardDirectionForVerticalCircle(boundaryEdge, circleData) {
-  const normal = normalize([circleData.direction[0], circleData.direction[1], 0]);
+function outwardDirectionsForProjectedCurve(boundaryEdge, circleData) {
+  const { points } = boundaryEdge;
+  const fallbackNormal = normalize([circleData.direction[0], circleData.direction[1], 0]);
+  const sideOffset = Math.max((circleData.radius || 1) * 1e-4, 1e-4);
+  const baseDirections = [];
 
-  if (!normal) {
+  if (!fallbackNormal) {
     return null;
   }
 
-  const sideOffset = Math.max((circleData.radius || 1) * 1e-4, 1e-4);
-  let positiveCoverage = 0;
-  let negativeCoverage = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const radial = normalize([
+      point[0] - circleData.center[0],
+      point[1] - circleData.center[1],
+      point[2] - circleData.center[2]
+    ]);
+    const analyticDirection = radial && Math.abs(circleData.direction[2]) > 1e-5
+      ? normalize([
+        circleData.direction[0] * radial[2] - radial[0] * circleData.direction[2],
+        circleData.direction[1] * radial[2] - radial[1] * circleData.direction[2],
+        0
+      ])
+      : null;
 
-  for (const point of boundaryEdge.points) {
-    positiveCoverage += pointCoverageScore(point, normal, boundaryEdge.passingFaceTriangles, sideOffset);
-    negativeCoverage += pointCoverageScore(point, scale(normal, -1), boundaryEdge.passingFaceTriangles, sideOffset);
+    baseDirections.push(analyticDirection || fallbackNormal);
   }
 
+  const positiveCoverage = points.reduce(
+    (score, point, index) => score + pointCoverageScore(point, baseDirections[index], boundaryEdge.passingFaceTriangles, sideOffset),
+    0
+  );
+  const negativeCoverage = points.reduce(
+    (score, point, index) => score + pointCoverageScore(point, scale(baseDirections[index], -1), boundaryEdge.passingFaceTriangles, sideOffset),
+    0
+  );
+
   if (positiveCoverage !== negativeCoverage) {
-    return positiveCoverage < negativeCoverage ? normal : scale(normal, -1);
+    const sign = positiveCoverage < negativeCoverage ? 1 : -1;
+    return baseDirections.map((direction) => scale(direction, sign));
   }
 
   if (boundaryEdge.passingFaceCenter) {
-    const passingSide = [
-      boundaryEdge.passingFaceCenter[0] - circleData.center[0],
-      boundaryEdge.passingFaceCenter[1] - circleData.center[1],
-      0
-    ];
+    const passingDot = points.reduce((sum, point, index) => {
+      const passingSide = [
+        boundaryEdge.passingFaceCenter[0] - point[0],
+        boundaryEdge.passingFaceCenter[1] - point[1],
+        0
+      ];
 
-    if (Math.hypot(passingSide[0], passingSide[1]) > 1e-9) {
-      return normal[0] * passingSide[0] + normal[1] * passingSide[1] < 0
-        ? normal
-        : scale(normal, -1);
+      if (Math.hypot(passingSide[0], passingSide[1]) <= 1e-9) {
+        return sum;
+      }
+
+      return sum + baseDirections[index][0] * passingSide[0] + baseDirections[index][1] * passingSide[1];
+    }, 0);
+
+    if (Math.abs(passingDot) > 1e-9) {
+      const sign = passingDot < 0 ? 1 : -1;
+      return baseDirections.map((direction) => scale(direction, sign));
     }
   }
 
-  return normal;
+  return baseDirections;
 }
 
 function circularDraftRadialSign(boundaryEdge, circleData) {
@@ -765,6 +794,16 @@ function draftedBottomPoint(point, outwardDirection, groundZ, draftAngleDegrees)
   ];
 }
 
+function tangentOrDraftPerpendicular(primaryTangent, draftDirection) {
+  const tangent = normalize(primaryTangent);
+
+  if (tangent) {
+    return tangent;
+  }
+
+  return draftDirection ? normalize([-draftDirection[1], draftDirection[0], 0]) : null;
+}
+
 function generateStraightBoundaryFace(oc, boundaryEdge, options) {
   const { draftAngleDegrees, groundZ } = options;
   const { edge, points } = boundaryEdge;
@@ -813,51 +852,63 @@ function generateStraightBoundaryFace(oc, boundaryEdge, options) {
   };
 }
 
-function generateVerticalCircleBoundaryFace(oc, boundaryEdge, options, stats) {
+function generateNonHorizontalCircleBoundaryFace(oc, boundaryEdge, options, stats) {
   const { draftAngleDegrees, groundZ } = options;
-  increment(stats, 'verticalCircleDetectionAttempts');
+  increment(stats, 'nonHorizontalCircleDetectionAttempts');
 
-  const occtCircleData = verticalCircleData(oc, boundaryEdge.edge);
+  const occtCircleData = nonHorizontalCircleData(oc, boundaryEdge.edge);
 
   if (occtCircleData) {
-    increment(stats, 'verticalCircleOcctCandidates');
+    increment(stats, 'nonHorizontalCircleOcctCandidates');
+
+    if (Math.abs(occtCircleData.direction[2]) <= 1e-5) {
+      increment(stats, 'verticalCircleOcctCandidates');
+    } else {
+      increment(stats, 'tiltedCircleOcctCandidates');
+    }
   }
 
   const circleData = occtCircleData || fittedVerticalCircleData(boundaryEdge.points, stats);
 
   if (!circleData) {
-    increment(stats, 'verticalCircleRejectedNoCircleData');
+    increment(stats, 'nonHorizontalCircleRejectedNoCircleData');
     return null;
   }
 
-  increment(stats, 'verticalCircleCandidates');
+  increment(stats, 'nonHorizontalCircleCandidates');
+
+  if (Math.abs(circleData.direction[2]) <= 1e-5) {
+    increment(stats, 'verticalCircleCandidates');
+  } else {
+    increment(stats, 'tiltedCircleCandidates');
+  }
 
   if (!Number.isFinite(circleData.radius)) {
-    increment(stats, 'verticalCircleRejectedInvalidRadius');
+    increment(stats, 'nonHorizontalCircleRejectedInvalidRadius');
     return null;
   }
 
   if (!Number.isFinite(groundZ)) {
-    increment(stats, 'verticalCircleRejectedInvalidGroundZ');
+    increment(stats, 'nonHorizontalCircleRejectedInvalidGroundZ');
     return null;
   }
 
   if (boundaryEdge.points.length < 3) {
-    increment(stats, 'verticalCircleRejectedTooFewPoints');
+    increment(stats, 'nonHorizontalCircleRejectedTooFewPoints');
     return null;
   }
 
-  const outwardDirection = outwardDirectionForVerticalCircle(boundaryEdge, circleData);
+  const outwardDirections = outwardDirectionsForProjectedCurve(boundaryEdge, circleData);
 
-  if (!outwardDirection) {
-    increment(stats, 'verticalCircleRejectedNoOutwardDirection');
+  if (!outwardDirections) {
+    increment(stats, 'nonHorizontalCircleRejectedNoOutwardDirection');
     return null;
   }
 
   const start = boundaryEdge.points[0];
   const end = boundaryEdge.points[boundaryEdge.points.length - 1];
   const topRow = boundaryEdge.points;
-  const bottomRow = topRow.map((point) => draftedBottomPoint(point, outwardDirection, groundZ, draftAngleDegrees));
+  const bottomRow = topRow.map((point, index) => draftedBottomPoint(point, outwardDirections[index], groundZ, draftAngleDegrees));
   const pointGrid = [0, 1 / 3, 2 / 3, 1].map((t) => topRow.map((point, index) => [
     point[0] + (bottomRow[index][0] - point[0]) * t,
     point[1] + (bottomRow[index][1] - point[1]) * t,
@@ -866,34 +917,37 @@ function generateVerticalCircleBoundaryFace(oc, boundaryEdge, options, stats) {
   const face = makeSmoothFaceFromPointGrid(oc, pointGrid);
 
   if (!face) {
-    increment(stats, 'verticalCircleRejectedNoFace');
+    increment(stats, 'nonHorizontalCircleRejectedNoFace');
     return null;
   }
 
   const startTangentPoint = topRow[1] || end;
   const endTangentPoint = topRow[topRow.length - 2] || start;
+  const startDraftDirection = outwardDirections[0];
+  const endDraftDirection = outwardDirections[outwardDirections.length - 1];
 
   return {
+    circleDirection: circleData.direction,
     endpoints: [
       {
-        draftDirection: outwardDirection,
+        draftDirection: startDraftDirection,
         key: pointKey(start),
         point: start,
-        tangent: normalize([
+        tangent: tangentOrDraftPerpendicular([
           startTangentPoint[0] - start[0],
           startTangentPoint[1] - start[1],
           0
-        ])
+        ], startDraftDirection)
       },
       {
-        draftDirection: outwardDirection,
+        draftDirection: endDraftDirection,
         key: pointKey(end),
         point: end,
-        tangent: normalize([
+        tangent: tangentOrDraftPerpendicular([
           endTangentPoint[0] - end[0],
           endTangentPoint[1] - end[1],
           0
-        ])
+        ], endDraftDirection)
       }
     ],
     face
@@ -976,27 +1030,30 @@ function generateHorizontalCircleBoundaryFace(oc, boundaryEdge, options) {
       return null;
     }
 
+    const startDraftDirection = scale(startRadial, radialSign);
+    const endDraftDirection = scale(endRadial, radialSign);
+
     return {
       endpoints: [
         {
-          draftDirection: scale(startRadial, radialSign),
+          draftDirection: startDraftDirection,
           key: pointKey(start),
           point: start,
-          tangent: normalize([
+          tangent: tangentOrDraftPerpendicular([
             startTangentPoint[0] - start[0],
             startTangentPoint[1] - start[1],
             0
-          ])
+          ], startDraftDirection)
         },
         {
-          draftDirection: scale(endRadial, radialSign),
+          draftDirection: endDraftDirection,
           key: pointKey(end),
           point: end,
-          tangent: normalize([
+          tangent: tangentOrDraftPerpendicular([
             endTangentPoint[0] - end[0],
             endTangentPoint[1] - end[1],
             0
-          ])
+          ], endDraftDirection)
         }
       ],
       face
@@ -1006,26 +1063,28 @@ function generateHorizontalCircleBoundaryFace(oc, boundaryEdge, options) {
   }
 }
 
-function outsideAngleForEndpointPair(left, right) {
+function outsideGapInfoForEndpointPair(left, right) {
   const leftTangentAngle = angleOf(left.tangent);
   const rightTangentAngle = angleOf(right.tangent);
   const outsideDirection = normalize(add(left.draftDirection, right.draftDirection)) || left.draftDirection;
   const outsideAngle = angleOf(outsideDirection);
   const ccwTangentSpan = ccwDelta(leftTangentAngle, rightTangentAngle);
+  const useLeftToRightSector = angleInCcwSector(outsideAngle, leftTangentAngle, rightTangentAngle);
 
-  return angleInCcwSector(outsideAngle, leftTangentAngle, rightTangentAngle)
-    ? ccwTangentSpan
-    : Math.PI * 2 - ccwTangentSpan;
+  return {
+    angle: useLeftToRightSector ? ccwTangentSpan : Math.PI * 2 - ccwTangentSpan,
+    useLeftToRightSector
+  };
 }
 
-function coneBoundsFromDraftDirections(leftDirection, rightDirection) {
+function coneBoundsFromDraftDirections(leftDirection, rightDirection, useLeftToRightSector) {
   const leftAngle = coneUForDirection(leftDirection);
   const rightAngle = coneUForDirection(rightDirection);
-  const ccwSpan = ccwDelta(leftAngle, rightAngle);
+  const start = useLeftToRightSector ? rightAngle : leftAngle;
+  const end = useLeftToRightSector ? leftAngle : rightAngle;
+  const ccwSpan = ccwDelta(start, end);
 
-  return ccwSpan <= Math.PI
-    ? { uMin: leftAngle, uMax: leftAngle + ccwSpan }
-    : { uMin: rightAngle, uMax: rightAngle + (Math.PI * 2 - ccwSpan) };
+  return { uMin: start, uMax: start + ccwSpan };
 }
 
 function makeCornerGapFace(oc, left, right, options) {
@@ -1050,7 +1109,8 @@ function makeCornerGapFace(oc, left, right, options) {
     return null;
   }
 
-  const outerAngle = outsideAngleForEndpointPair(left, right);
+  const outerGap = outsideGapInfoForEndpointPair(left, right);
+  const outerAngle = outerGap.angle;
 
   if (Math.abs(Math.PI - outerAngle) <= ANGLE_TOLERANCE || outerAngle < Math.PI) {
     return null;
@@ -1064,7 +1124,7 @@ function makeCornerGapFace(oc, left, right, options) {
 
   const semiAngle = Math.atan2(radiusOffset, height);
   const vMax = height / Math.cos(semiAngle);
-  const bounds = coneBoundsFromDraftDirections(leftDraft, rightDraft);
+  const bounds = coneBoundsFromDraftDirections(leftDraft, rightDraft, outerGap.useLeftToRightSector);
 
   if (!Number.isFinite(semiAngle) || !Number.isFinite(vMax) || Math.abs(bounds.uMax - bounds.uMin) <= ANGLE_TOLERANCE) {
     return null;
@@ -1140,7 +1200,9 @@ export function generateDraftFaces(oc, boundaryEdges, options = {}) {
     boundaryEdges: boundaryEdges.length,
     generatedConeFaces: 0,
     generatedCornerGapFaces: 0,
+    generatedNonHorizontalCircleFaces: 0,
     generatedStraightFaces: 0,
+    generatedTiltedCircleFaces: 0,
     generatedVerticalCircleFaces: 0,
     skippedCornerGaps: 0,
     skippedEdges: 0
@@ -1149,12 +1211,19 @@ export function generateDraftFaces(oc, boundaryEdges, options = {}) {
   for (const boundaryEdge of boundaryEdges) {
     recordBoundaryEdgeCurveType(oc, boundaryEdge.edge, stats);
 
-    const verticalCircleFace = generateVerticalCircleBoundaryFace(oc, boundaryEdge, options, stats);
+    const nonHorizontalCircleFace = generateNonHorizontalCircleBoundaryFace(oc, boundaryEdge, options, stats);
 
-    if (verticalCircleFace) {
-      faces.push(verticalCircleFace.face);
-      endpointRecords.push(...verticalCircleFace.endpoints.filter((endpoint) => endpoint.tangent));
-      stats.generatedVerticalCircleFaces += 1;
+    if (nonHorizontalCircleFace) {
+      faces.push(nonHorizontalCircleFace.face);
+      endpointRecords.push(...nonHorizontalCircleFace.endpoints.filter((endpoint) => endpoint.tangent));
+      stats.generatedNonHorizontalCircleFaces += 1;
+
+      if (Math.abs(nonHorizontalCircleFace.circleDirection[2]) <= 1e-5) {
+        stats.generatedVerticalCircleFaces += 1;
+      } else {
+        stats.generatedTiltedCircleFaces += 1;
+      }
+
       continue;
     }
 
