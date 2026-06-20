@@ -2,6 +2,7 @@ import { callAny, enumValue, makeInstance, tryCallAnyArgs } from './occtRuntime.
 
 const LINE_TOLERANCE = 1e-5;
 const SIDE_TEST_TOLERANCE = 1e-8;
+const ANGLE_TOLERANCE = 1e-5;
 
 function add(a, b) {
   return [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
@@ -19,6 +20,45 @@ function normalize(vector) {
   }
 
   return [vector[0] / length, vector[1] / length, vector[2] / length];
+}
+
+function pointKey(point) {
+  return [
+    Math.round(point[0] * 1e6),
+    Math.round(point[1] * 1e6),
+    Math.round(point[2] * 1e6)
+  ].join(',');
+}
+
+function angleOf(vector) {
+  return Math.atan2(vector[1], vector[0]);
+}
+
+function normalizePositiveAngle(angle) {
+  let value = angle;
+
+  while (value < 0) {
+    value += Math.PI * 2;
+  }
+
+  while (value >= Math.PI * 2) {
+    value -= Math.PI * 2;
+  }
+
+  return value;
+}
+
+function ccwDelta(from, to) {
+  return normalizePositiveAngle(to - from);
+}
+
+function angleBetweenVectors(left, right) {
+  const dot = Math.max(-1, Math.min(1, left[0] * right[0] + left[1] * right[1]));
+  return Math.acos(dot);
+}
+
+function angleInCcwSector(angle, start, end) {
+  return ccwDelta(start, angle) <= ccwDelta(start, end) + ANGLE_TOLERANCE;
 }
 
 function projectedDistanceToSegment(point, start, end) {
@@ -258,6 +298,10 @@ function coneUForPoint(point, center) {
   return normalizeAngle(Math.atan2(center[1] - point[1], point[0] - center[0]));
 }
 
+function coneUForDirection(direction) {
+  return normalizeAngle(Math.atan2(-direction[1], direction[0]));
+}
+
 function coneUBoundsFromArcPoints(points, center) {
   const angles = points
     .filter((point) => Math.hypot(point[0] - center[0], point[1] - center[1]) > 1e-7)
@@ -297,6 +341,21 @@ function coneUBoundsFromArcPoints(points, center) {
 
 function makeConeAxis(oc, center) {
   const point = makeInstance(oc, 'gp_Pnt', center);
+  const direction = makeInstance(oc, 'gp_Dir', [0, 0, -1]);
+
+  try {
+    return makeInstance(oc, 'gp_Ax3', [
+      point,
+      direction,
+      makeInstance(oc, 'gp_Dir', [1, 0, 0])
+    ]);
+  } catch {
+    return makeInstance(oc, 'gp_Ax3', [point, direction]);
+  }
+}
+
+function makeApexConeAxis(oc, apex) {
+  const point = makeInstance(oc, 'gp_Pnt', apex);
   const direction = makeInstance(oc, 'gp_Dir', [0, 0, -1]);
 
   try {
@@ -409,7 +468,29 @@ function generateStraightBoundaryFace(oc, boundaryEdge, options) {
 
   const draftedEnd = draftedBottomPoint(end, outwardDirection, groundZ, draftAngleDegrees);
   const draftedStart = draftedBottomPoint(start, outwardDirection, groundZ, draftAngleDegrees);
-  return makeFaceFromPoints(oc, [start, end, draftedEnd, draftedStart]);
+  const face = makeFaceFromPoints(oc, [start, end, draftedEnd, draftedStart]);
+
+  if (!face) {
+    return null;
+  }
+
+  return {
+    endpoints: [
+      {
+        draftDirection: outwardDirection,
+        key: pointKey(start),
+        point: start,
+        tangent: normalize([end[0] - start[0], end[1] - start[1], 0])
+      },
+      {
+        draftDirection: outwardDirection,
+        key: pointKey(end),
+        point: end,
+        tangent: normalize([start[0] - end[0], start[1] - end[1], 0])
+      }
+    ],
+    face
+  };
 }
 
 function generateHorizontalCircleBoundaryFace(oc, boundaryEdge, options) {
@@ -473,18 +554,186 @@ function generateHorizontalCircleBoundaryFace(oc, boundaryEdge, options) {
     }
 
     const face = callAny(builder, ['Face']);
+    if (callAny(face, ['IsNull'])) {
+      return null;
+    }
+
+    const start = boundaryEdge.points[0];
+    const end = boundaryEdge.points[boundaryEdge.points.length - 1];
+    const startRadial = normalize([start[0] - circleData.center[0], start[1] - circleData.center[1], 0]);
+    const endRadial = normalize([end[0] - circleData.center[0], end[1] - circleData.center[1], 0]);
+    const startTangentPoint = boundaryEdge.points[1] || end;
+    const endTangentPoint = boundaryEdge.points[boundaryEdge.points.length - 2] || start;
+
+    if (!startRadial || !endRadial) {
+      return null;
+    }
+
+    return {
+      endpoints: [
+        {
+          draftDirection: scale(startRadial, radialSign),
+          key: pointKey(start),
+          point: start,
+          tangent: normalize([
+            startTangentPoint[0] - start[0],
+            startTangentPoint[1] - start[1],
+            0
+          ])
+        },
+        {
+          draftDirection: scale(endRadial, radialSign),
+          key: pointKey(end),
+          point: end,
+          tangent: normalize([
+            endTangentPoint[0] - end[0],
+            endTangentPoint[1] - end[1],
+            0
+          ])
+        }
+      ],
+      face
+    };
+  } catch {
+    return null;
+  }
+}
+
+function outsideAngleForEndpointPair(left, right) {
+  const leftTangentAngle = angleOf(left.tangent);
+  const rightTangentAngle = angleOf(right.tangent);
+  const outsideDirection = normalize(add(left.draftDirection, right.draftDirection)) || left.draftDirection;
+  const outsideAngle = angleOf(outsideDirection);
+  const ccwTangentSpan = ccwDelta(leftTangentAngle, rightTangentAngle);
+
+  return angleInCcwSector(outsideAngle, leftTangentAngle, rightTangentAngle)
+    ? ccwTangentSpan
+    : Math.PI * 2 - ccwTangentSpan;
+}
+
+function coneBoundsFromDraftDirections(leftDirection, rightDirection) {
+  const leftAngle = coneUForDirection(leftDirection);
+  const rightAngle = coneUForDirection(rightDirection);
+  const ccwSpan = ccwDelta(leftAngle, rightAngle);
+
+  return ccwSpan <= Math.PI
+    ? { uMin: leftAngle, uMax: leftAngle + ccwSpan }
+    : { uMin: rightAngle, uMax: rightAngle + (Math.PI * 2 - ccwSpan) };
+}
+
+function makeCornerGapFace(oc, left, right, options) {
+  const { draftAngleDegrees, groundZ } = options;
+  const vertex = left.point;
+  const height = vertex[2] - groundZ;
+
+  if (height <= 1e-7) {
+    return null;
+  }
+
+  const leftDraft = normalize(left.draftDirection);
+  const rightDraft = normalize(right.draftDirection);
+
+  if (!leftDraft || !rightDraft) {
+    return null;
+  }
+
+  const draftAngle = angleBetweenVectors(leftDraft, rightDraft);
+
+  if (Math.abs(Math.PI - draftAngle) <= ANGLE_TOLERANCE || draftAngle <= ANGLE_TOLERANCE) {
+    return null;
+  }
+
+  const outerAngle = outsideAngleForEndpointPair(left, right);
+
+  if (Math.abs(Math.PI - outerAngle) <= ANGLE_TOLERANCE || outerAngle < Math.PI) {
+    return null;
+  }
+
+  const radiusOffset = Math.tan((draftAngleDegrees * Math.PI) / 180) * height;
+
+  if (radiusOffset <= 1e-7) {
+    return null;
+  }
+
+  const semiAngle = Math.atan2(radiusOffset, height);
+  const vMax = height / Math.cos(semiAngle);
+  const bounds = coneBoundsFromDraftDirections(leftDraft, rightDraft);
+
+  if (!Number.isFinite(semiAngle) || !Number.isFinite(vMax) || Math.abs(bounds.uMax - bounds.uMin) <= ANGLE_TOLERANCE) {
+    return null;
+  }
+
+  try {
+    const cone = makeInstance(oc, 'gp_Cone', [makeApexConeAxis(oc, vertex), semiAngle, 0]);
+    const builder = makeInstance(oc, 'BRepBuilderAPI_MakeFace', [
+      cone,
+      bounds.uMin,
+      bounds.uMax,
+      0,
+      vMax
+    ]);
+    const done = tryCallAnyArgs(builder, ['IsDone'], [[]]);
+
+    if (done.called && !done.value) {
+      return null;
+    }
+
+    const face = callAny(builder, ['Face']);
     return callAny(face, ['IsNull']) ? null : face;
   } catch {
     return null;
   }
 }
 
+function generateCornerGapFaces(oc, endpointRecords, options) {
+  const groups = new Map();
+  const faces = [];
+  let skipped = 0;
+
+  for (const endpoint of endpointRecords) {
+    if (!endpoint?.key || !endpoint?.tangent || !endpoint?.draftDirection) {
+      continue;
+    }
+
+    if (!groups.has(endpoint.key)) {
+      groups.set(endpoint.key, []);
+    }
+
+    groups.get(endpoint.key).push(endpoint);
+  }
+
+  for (const endpoints of groups.values()) {
+    if (endpoints.length < 2) {
+      continue;
+    }
+
+    const sorted = [...endpoints].sort((left, right) => angleOf(left.tangent) - angleOf(right.tangent));
+
+    for (let index = 0; index < sorted.length; index += 1) {
+      const left = sorted[index];
+      const right = sorted[(index + 1) % sorted.length];
+      const face = makeCornerGapFace(oc, left, right, options);
+
+      if (face) {
+        faces.push(face);
+      } else {
+        skipped += 1;
+      }
+    }
+  }
+
+  return { faces, skipped };
+}
+
 export function generateDraftFaces(oc, boundaryEdges, options = {}) {
   const faces = [];
+  const endpointRecords = [];
   const stats = {
     boundaryEdges: boundaryEdges.length,
     generatedConeFaces: 0,
+    generatedCornerGapFaces: 0,
     generatedStraightFaces: 0,
+    skippedCornerGaps: 0,
     skippedEdges: 0
   };
 
@@ -492,7 +741,8 @@ export function generateDraftFaces(oc, boundaryEdges, options = {}) {
     const straightFace = generateStraightBoundaryFace(oc, boundaryEdge, options);
 
     if (straightFace) {
-      faces.push(straightFace);
+      faces.push(straightFace.face);
+      endpointRecords.push(...straightFace.endpoints.filter((endpoint) => endpoint.tangent));
       stats.generatedStraightFaces += 1;
       continue;
     }
@@ -500,13 +750,19 @@ export function generateDraftFaces(oc, boundaryEdges, options = {}) {
     const coneFace = generateHorizontalCircleBoundaryFace(oc, boundaryEdge, options);
 
     if (coneFace) {
-      faces.push(coneFace);
+      faces.push(coneFace.face);
+      endpointRecords.push(...coneFace.endpoints.filter((endpoint) => endpoint.tangent));
       stats.generatedConeFaces += 1;
       continue;
     }
 
     stats.skippedEdges += 1;
   }
+
+  const cornerGapFaces = generateCornerGapFaces(oc, endpointRecords, options);
+  faces.push(...cornerGapFaces.faces);
+  stats.generatedCornerGapFaces = cornerGapFaces.faces.length;
+  stats.skippedCornerGaps = cornerGapFaces.skipped;
 
   return { faces, stats };
 }
