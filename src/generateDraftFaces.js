@@ -300,6 +300,35 @@ function nonHorizontalCircleData(oc, edge) {
   }
 }
 
+function ellipseData(oc, edge) {
+  try {
+    const curve = makeInstance(oc, 'BRepAdaptor_Curve', [edge]);
+    const type = callAny(curve, ['GetType']);
+
+    if (type !== enumValue(oc, 'GeomAbs_CurveType', 'GeomAbs_Ellipse')) {
+      return null;
+    }
+
+    const ellipse = callAny(curve, ['Ellipse']);
+    const position = callAny(ellipse, ['Position']);
+    const direction = pointToArray(callAny(position, ['Direction']));
+    const majorRadius = callAny(ellipse, ['MajorRadius']);
+    const minorRadius = callAny(ellipse, ['MinorRadius']);
+
+    return {
+      center: pointToArray(callAny(ellipse, ['Location'])),
+      direction,
+      ellipse,
+      first: callAny(curve, ['FirstParameter']),
+      kind: 'ellipse',
+      last: callAny(curve, ['LastParameter']),
+      radius: Math.max(majorRadius, minorRadius)
+    };
+  } catch {
+    return null;
+  }
+}
+
 function circleFromThreeLocalPoints(a, b, c) {
   const d = 2 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
 
@@ -449,10 +478,6 @@ function outwardDirectionsForProjectedCurve(boundaryEdge, circleData) {
   const sideOffset = Math.max((circleData.radius || 1) * 1e-4, 1e-4);
   const baseDirections = [];
 
-  if (!fallbackNormal) {
-    return null;
-  }
-
   for (let index = 0; index < points.length; index += 1) {
     const point = points[index];
     const radial = normalize([
@@ -467,8 +492,19 @@ function outwardDirectionsForProjectedCurve(boundaryEdge, circleData) {
         0
       ])
       : null;
+    const radialDirection = normalize([
+      point[0] - circleData.center[0],
+      point[1] - circleData.center[1],
+      0
+    ]);
 
-    baseDirections.push(analyticDirection || fallbackNormal);
+    const baseDirection = analyticDirection || fallbackNormal || radialDirection;
+
+    if (!baseDirection) {
+      return null;
+    }
+
+    baseDirections.push(baseDirection);
   }
 
   const positiveCoverage = points.reduce(
@@ -852,11 +888,12 @@ function generateStraightBoundaryFace(oc, boundaryEdge, options) {
   };
 }
 
-function generateNonHorizontalCircleBoundaryFace(oc, boundaryEdge, options, stats) {
+function generateCurvedBoundaryFace(oc, boundaryEdge, options, stats) {
   const { draftAngleDegrees, groundZ } = options;
-  increment(stats, 'nonHorizontalCircleDetectionAttempts');
+  increment(stats, 'curvedDraftDetectionAttempts');
 
   const occtCircleData = nonHorizontalCircleData(oc, boundaryEdge.edge);
+  const occtEllipseData = ellipseData(oc, boundaryEdge.edge);
 
   if (occtCircleData) {
     increment(stats, 'nonHorizontalCircleOcctCandidates');
@@ -868,40 +905,46 @@ function generateNonHorizontalCircleBoundaryFace(oc, boundaryEdge, options, stat
     }
   }
 
-  const circleData = occtCircleData || fittedVerticalCircleData(boundaryEdge.points, stats);
+  if (occtEllipseData) {
+    increment(stats, 'ellipseOcctCandidates');
+  }
+
+  const circleData = occtCircleData || occtEllipseData || fittedVerticalCircleData(boundaryEdge.points, stats);
 
   if (!circleData) {
-    increment(stats, 'nonHorizontalCircleRejectedNoCircleData');
+    increment(stats, 'curvedDraftRejectedNoCurveData');
     return null;
   }
 
-  increment(stats, 'nonHorizontalCircleCandidates');
+  increment(stats, 'curvedDraftCandidates');
 
-  if (Math.abs(circleData.direction[2]) <= 1e-5) {
+  if (circleData.kind === 'ellipse') {
+    increment(stats, 'ellipseCandidates');
+  } else if (Math.abs(circleData.direction[2]) <= 1e-5) {
     increment(stats, 'verticalCircleCandidates');
   } else {
     increment(stats, 'tiltedCircleCandidates');
   }
 
   if (!Number.isFinite(circleData.radius)) {
-    increment(stats, 'nonHorizontalCircleRejectedInvalidRadius');
+    increment(stats, 'curvedDraftRejectedInvalidRadius');
     return null;
   }
 
   if (!Number.isFinite(groundZ)) {
-    increment(stats, 'nonHorizontalCircleRejectedInvalidGroundZ');
+    increment(stats, 'curvedDraftRejectedInvalidGroundZ');
     return null;
   }
 
   if (boundaryEdge.points.length < 3) {
-    increment(stats, 'nonHorizontalCircleRejectedTooFewPoints');
+    increment(stats, 'curvedDraftRejectedTooFewPoints');
     return null;
   }
 
   const outwardDirections = outwardDirectionsForProjectedCurve(boundaryEdge, circleData);
 
   if (!outwardDirections) {
-    increment(stats, 'nonHorizontalCircleRejectedNoOutwardDirection');
+    increment(stats, 'curvedDraftRejectedNoOutwardDirection');
     return null;
   }
 
@@ -917,7 +960,7 @@ function generateNonHorizontalCircleBoundaryFace(oc, boundaryEdge, options, stat
   const face = makeSmoothFaceFromPointGrid(oc, pointGrid);
 
   if (!face) {
-    increment(stats, 'nonHorizontalCircleRejectedNoFace');
+    increment(stats, 'curvedDraftRejectedNoFace');
     return null;
   }
 
@@ -928,6 +971,7 @@ function generateNonHorizontalCircleBoundaryFace(oc, boundaryEdge, options, stat
 
   return {
     circleDirection: circleData.direction,
+    curveKind: circleData.kind || 'circle',
     endpoints: [
       {
         draftDirection: startDraftDirection,
@@ -1199,7 +1243,9 @@ export function generateDraftFaces(oc, boundaryEdges, options = {}) {
     boundaryEdgeCurveTypes: {},
     boundaryEdges: boundaryEdges.length,
     generatedConeFaces: 0,
+    generatedCurvedDraftFaces: 0,
     generatedCornerGapFaces: 0,
+    generatedEllipseFaces: 0,
     generatedNonHorizontalCircleFaces: 0,
     generatedStraightFaces: 0,
     generatedTiltedCircleFaces: 0,
@@ -1211,17 +1257,23 @@ export function generateDraftFaces(oc, boundaryEdges, options = {}) {
   for (const boundaryEdge of boundaryEdges) {
     recordBoundaryEdgeCurveType(oc, boundaryEdge.edge, stats);
 
-    const nonHorizontalCircleFace = generateNonHorizontalCircleBoundaryFace(oc, boundaryEdge, options, stats);
+    const curvedFace = generateCurvedBoundaryFace(oc, boundaryEdge, options, stats);
 
-    if (nonHorizontalCircleFace) {
-      faces.push(nonHorizontalCircleFace.face);
-      endpointRecords.push(...nonHorizontalCircleFace.endpoints.filter((endpoint) => endpoint.tangent));
-      stats.generatedNonHorizontalCircleFaces += 1;
+    if (curvedFace) {
+      faces.push(curvedFace.face);
+      endpointRecords.push(...curvedFace.endpoints.filter((endpoint) => endpoint.tangent));
+      stats.generatedCurvedDraftFaces += 1;
 
-      if (Math.abs(nonHorizontalCircleFace.circleDirection[2]) <= 1e-5) {
-        stats.generatedVerticalCircleFaces += 1;
+      if (curvedFace.curveKind === 'ellipse') {
+        stats.generatedEllipseFaces += 1;
       } else {
-        stats.generatedTiltedCircleFaces += 1;
+        stats.generatedNonHorizontalCircleFaces += 1;
+
+        if (Math.abs(curvedFace.circleDirection[2]) <= 1e-5) {
+          stats.generatedVerticalCircleFaces += 1;
+        } else {
+          stats.generatedTiltedCircleFaces += 1;
+        }
       }
 
       continue;
