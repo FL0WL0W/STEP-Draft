@@ -329,6 +329,51 @@ function ellipseData(oc, edge) {
   }
 }
 
+function estimatedPointSpan(points) {
+  if (!points || points.length === 0) {
+    return 1;
+  }
+
+  let minX = points[0][0];
+  let minY = points[0][1];
+  let minZ = points[0][2];
+  let maxX = points[0][0];
+  let maxY = points[0][1];
+  let maxZ = points[0][2];
+
+  for (const point of points) {
+    minX = Math.min(minX, point[0]);
+    minY = Math.min(minY, point[1]);
+    minZ = Math.min(minZ, point[2]);
+    maxX = Math.max(maxX, point[0]);
+    maxY = Math.max(maxY, point[1]);
+    maxZ = Math.max(maxZ, point[2]);
+  }
+
+  return Math.max(Math.hypot(maxX - minX, maxY - minY, maxZ - minZ), 1);
+}
+
+function bsplineData(oc, boundaryEdge) {
+  try {
+    const curve = makeInstance(oc, 'BRepAdaptor_Curve', [boundaryEdge.edge]);
+    const type = callAny(curve, ['GetType']);
+
+    if (type !== enumValue(oc, 'GeomAbs_CurveType', 'GeomAbs_BSplineCurve')) {
+      return null;
+    }
+
+    return {
+      curve,
+      first: callAny(curve, ['FirstParameter']),
+      kind: 'bspline',
+      last: callAny(curve, ['LastParameter']),
+      radius: estimatedPointSpan(boundaryEdge.points)
+    };
+  } catch {
+    return null;
+  }
+}
+
 function circleFromThreeLocalPoints(a, b, c) {
   const d = 2 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
 
@@ -472,33 +517,47 @@ function fittedVerticalCircleData(points, stats) {
   };
 }
 
-function outwardDirectionsForProjectedCurve(boundaryEdge, circleData) {
+function projectedTangentNormal(points, index) {
+  const previous = points[Math.max(index - 1, 0)];
+  const next = points[Math.min(index + 1, points.length - 1)];
+  const tangent = normalize([next[0] - previous[0], next[1] - previous[1], 0]);
+
+  return tangent ? [-tangent[1], tangent[0], 0] : null;
+}
+
+function outwardDirectionsForProjectedCurve(boundaryEdge, curveData) {
   const { points } = boundaryEdge;
-  const fallbackNormal = normalize([circleData.direction[0], circleData.direction[1], 0]);
-  const sideOffset = Math.max((circleData.radius || 1) * 1e-4, 1e-4);
+  const fallbackNormal = curveData.direction ? normalize([curveData.direction[0], curveData.direction[1], 0]) : null;
+  const sideOffset = Math.max((curveData.radius || 1) * 1e-4, 1e-4);
   const baseDirections = [];
 
   for (let index = 0; index < points.length; index += 1) {
     const point = points[index];
-    const radial = normalize([
-      point[0] - circleData.center[0],
-      point[1] - circleData.center[1],
-      point[2] - circleData.center[2]
-    ]);
-    const analyticDirection = radial && Math.abs(circleData.direction[2]) > 1e-5
+    const hasConicFrame = curveData.center && curveData.direction;
+    const radial = hasConicFrame
       ? normalize([
-        circleData.direction[0] * radial[2] - radial[0] * circleData.direction[2],
-        circleData.direction[1] * radial[2] - radial[1] * circleData.direction[2],
+        point[0] - curveData.center[0],
+        point[1] - curveData.center[1],
+        point[2] - curveData.center[2]
+      ])
+      : null;
+    const analyticDirection = radial && Math.abs(curveData.direction[2]) > 1e-5
+      ? normalize([
+        curveData.direction[0] * radial[2] - radial[0] * curveData.direction[2],
+        curveData.direction[1] * radial[2] - radial[1] * curveData.direction[2],
         0
       ])
       : null;
-    const radialDirection = normalize([
-      point[0] - circleData.center[0],
-      point[1] - circleData.center[1],
-      0
-    ]);
+    const radialDirection = curveData.center
+      ? normalize([
+        point[0] - curveData.center[0],
+        point[1] - curveData.center[1],
+        0
+      ])
+      : null;
+    const sampledDirection = projectedTangentNormal(points, index);
 
-    const baseDirection = analyticDirection || fallbackNormal || radialDirection;
+    const baseDirection = analyticDirection || fallbackNormal || radialDirection || sampledDirection;
 
     if (!baseDirection) {
       return null;
@@ -894,6 +953,7 @@ function generateCurvedBoundaryFace(oc, boundaryEdge, options, stats) {
 
   const occtCircleData = nonHorizontalCircleData(oc, boundaryEdge.edge);
   const occtEllipseData = ellipseData(oc, boundaryEdge.edge);
+  const occtBSplineData = bsplineData(oc, boundaryEdge);
 
   if (occtCircleData) {
     increment(stats, 'nonHorizontalCircleOcctCandidates');
@@ -909,7 +969,11 @@ function generateCurvedBoundaryFace(oc, boundaryEdge, options, stats) {
     increment(stats, 'ellipseOcctCandidates');
   }
 
-  const circleData = occtCircleData || occtEllipseData || fittedVerticalCircleData(boundaryEdge.points, stats);
+  if (occtBSplineData) {
+    increment(stats, 'bsplineOcctCandidates');
+  }
+
+  const circleData = occtCircleData || occtEllipseData || occtBSplineData || fittedVerticalCircleData(boundaryEdge.points, stats);
 
   if (!circleData) {
     increment(stats, 'curvedDraftRejectedNoCurveData');
@@ -918,7 +982,9 @@ function generateCurvedBoundaryFace(oc, boundaryEdge, options, stats) {
 
   increment(stats, 'curvedDraftCandidates');
 
-  if (circleData.kind === 'ellipse') {
+  if (circleData.kind === 'bspline') {
+    increment(stats, 'bsplineCandidates');
+  } else if (circleData.kind === 'ellipse') {
     increment(stats, 'ellipseCandidates');
   } else if (Math.abs(circleData.direction[2]) <= 1e-5) {
     increment(stats, 'verticalCircleCandidates');
@@ -970,7 +1036,7 @@ function generateCurvedBoundaryFace(oc, boundaryEdge, options, stats) {
   const endDraftDirection = outwardDirections[outwardDirections.length - 1];
 
   return {
-    circleDirection: circleData.direction,
+    circleDirection: circleData.direction || [0, 0, 0],
     curveKind: circleData.kind || 'circle',
     endpoints: [
       {
@@ -1242,6 +1308,7 @@ export function generateDraftFaces(oc, boundaryEdges, options = {}) {
   const stats = {
     boundaryEdgeCurveTypes: {},
     boundaryEdges: boundaryEdges.length,
+    generatedBSplineFaces: 0,
     generatedConeFaces: 0,
     generatedCurvedDraftFaces: 0,
     generatedCornerGapFaces: 0,
@@ -1266,6 +1333,8 @@ export function generateDraftFaces(oc, boundaryEdges, options = {}) {
 
       if (curvedFace.curveKind === 'ellipse') {
         stats.generatedEllipseFaces += 1;
+      } else if (curvedFace.curveKind === 'bspline') {
+        stats.generatedBSplineFaces += 1;
       } else {
         stats.generatedNonHorizontalCircleFaces += 1;
 
